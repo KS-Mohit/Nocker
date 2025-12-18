@@ -1,8 +1,10 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Dict, List, Optional
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.ai.ollama_service import OllamaService
+from app.services.ai.ollama_tracker import ollama_tracker
+from app.api.deps import get_db
 
 router = APIRouter()
 
@@ -11,37 +13,48 @@ class GenerateRequest(BaseModel):
     prompt: str
     system_prompt: Optional[str] = None
     temperature: float = 0.7
+    user_id: int = 1
 
 
 class ChatRequest(BaseModel):
     messages: List[Dict[str, str]]
     temperature: float = 0.7
+    user_id: int = 1
 
 
 class AnswerQuestionRequest(BaseModel):
     question: str
     user_profile: Dict
     job_details: Dict
+    user_id: int = 1
+    job_id: Optional[int] = None
 
 
 class CoverLetterRequest(BaseModel):
     user_profile: Dict
     job_details: Dict
     template: Optional[str] = None
+    user_id: int = 1
+    job_id: Optional[int] = None
 
 
 @router.post("/generate")
-async def generate_text(request: GenerateRequest):
+async def generate_text(
+    request: GenerateRequest,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Generate text using Ollama
+    Generate text using Ollama with token tracking
     """
-    ollama = OllamaService()
-    
     try:
-        response = await ollama.generate(
+        response = await ollama_tracker.generate_with_tracking(
             prompt=request.prompt,
+            db=db,
+            user_id=request.user_id,
+            operation_type="text_generation",
             system_prompt=request.system_prompt,
-            temperature=request.temperature
+            temperature=request.temperature,
+            endpoint="/ai/generate"
         )
         
         return {
@@ -51,21 +64,24 @@ async def generate_text(request: GenerateRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await ollama.close()
 
 
 @router.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Chat with Ollama
+    Chat with Ollama with token tracking
     """
-    ollama = OllamaService()
-    
     try:
-        response = await ollama.chat(
+        response = await ollama_tracker.chat_with_tracking(
             messages=request.messages,
-            temperature=request.temperature
+            db=db,
+            user_id=request.user_id,
+            operation_type="chat",
+            temperature=request.temperature,
+            endpoint="/ai/chat"
         )
         
         return {
@@ -75,22 +91,24 @@ async def chat(request: ChatRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await ollama.close()
 
 
 @router.post("/answer-question")
-async def answer_job_question(request: AnswerQuestionRequest):
+async def answer_job_question(
+    request: AnswerQuestionRequest,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Answer a job application question using AI
+    Answer a job application question using AI with token tracking
     """
-    ollama = OllamaService()
-    
     try:
-        answer = await ollama.answer_job_question(
+        answer = await ollama_tracker.answer_job_question_with_tracking(
             question=request.question,
             user_profile=request.user_profile,
-            job_details=request.job_details
+            job_details=request.job_details,
+            db=db,
+            user_id=request.user_id,
+            job_id=request.job_id
         )
         
         return {
@@ -101,21 +119,23 @@ async def answer_job_question(request: AnswerQuestionRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await ollama.close()
 
 
 @router.post("/generate-cover-letter")
-async def generate_cover_letter(request: CoverLetterRequest):
+async def generate_cover_letter(
+    request: CoverLetterRequest,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Generate a cover letter using AI
+    Generate a cover letter using AI with token tracking
     """
-    ollama = OllamaService()
-    
     try:
-        cover_letter = await ollama.generate_cover_letter(
+        cover_letter = await ollama_tracker.generate_cover_letter_with_tracking(
             user_profile=request.user_profile,
             job_details=request.job_details,
+            db=db,
+            user_id=request.user_id,
+            job_id=request.job_id,
             template=request.template
         )
         
@@ -126,5 +146,3 @@ async def generate_cover_letter(request: CoverLetterRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await ollama.close()

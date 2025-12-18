@@ -7,13 +7,13 @@ from typing import Optional
 from app.api.deps import get_db
 from app.models.knowledge_base import KnowledgeBase
 from app.services.rag.rag_service import get_rag_service
-from app.services.ai.ollama_service import OllamaService
+from app.services.ai.ollama_tracker import ollama_tracker
 
 router = APIRouter()
 
 
 class IndexKnowledgeBaseRequest(BaseModel):
-    kb_id: Optional[int] = None  # If None, use current user's KB
+    kb_id: Optional[int] = None
 
 
 class SearchRequest(BaseModel):
@@ -27,6 +27,7 @@ class AnswerWithRAGRequest(BaseModel):
     question: str
     job_title: Optional[str] = None
     company: Optional[str] = None
+    user_id: int = 1
 
 
 @router.post("/index")
@@ -36,16 +37,9 @@ async def index_knowledge_base(
 ):
     """
     Index knowledge base into Qdrant for semantic search
-    
-    This creates embeddings for:
-    - Work experiences
-    - Projects
-    - Skills
-    - Q&A pairs
     """
-    kb_id = request.kb_id or 1  # Default to user 1
+    kb_id = request.kb_id or 1
     
-    # Get knowledge base
     result = await db.execute(
         select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
     )
@@ -54,7 +48,6 @@ async def index_knowledge_base(
     if not kb:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
     
-    # Prepare data for indexing
     kb_data = {
         "work_experience": kb.work_experience or [],
         "projects": kb.projects or [],
@@ -62,12 +55,10 @@ async def index_knowledge_base(
         "qa_pairs": kb.qa_pairs or {}
     }
     
-    # Index into Qdrant
     rag_service = get_rag_service()
     try:
         rag_service.index_knowledge_base(kb_id=kb_id, knowledge_base=kb_data)
         
-        # Update embedding_id in database
         kb.embedding_id = f"indexed_{kb_id}"
         await db.commit()
         
@@ -92,16 +83,9 @@ async def search_knowledge_base(
 ):
     """
     Search knowledge base for relevant context
-    
-    Returns semantically similar:
-    - Work experiences
-    - Projects
-    - Skills
-    - Q&A pairs
     """
-    kb_id = 1  # Hardcoded user
+    kb_id = 1
     
-    # Check if KB is indexed
     result = await db.execute(
         select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
     )
@@ -116,7 +100,6 @@ async def search_knowledge_base(
             detail="Knowledge base not indexed. Call /rag/index first."
         )
     
-    # Search
     rag_service = get_rag_service()
     try:
         retrieved = rag_service.retrieve_relevant_context(
@@ -142,18 +125,12 @@ async def answer_question_with_rag(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Answer a job application question using RAG
-    
-    This will:
-    1. Search for relevant experiences/projects/skills
-    2. Build focused context
-    3. Use AI to generate answer with retrieved context
+    Answer a job application question using RAG with token tracking
     """
-    kb_id = 1  # Hardcoded user
+    kb_id = request.user_id
     
-    # Get knowledge base
     result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
+        select(KnowledgeBase).where(KnowledgeBase.user_id == kb_id)
     )
     kb = result.scalar_one_or_none()
     
@@ -166,9 +143,7 @@ async def answer_question_with_rag(
             detail="Knowledge base not indexed. Call /rag/index first."
         )
     
-    # Retrieve relevant context
     rag_service = get_rag_service()
-    ollama = OllamaService()
     
     try:
         # 1. Search for relevant context
@@ -183,33 +158,37 @@ async def answer_question_with_rag(
         # 2. Build context string
         context_str = rag_service.build_context_string(retrieved)
         
-        # 3. Create enhanced prompt with retrieved context
-        system_prompt = """You are a professional career advisor answering job application questions.
-
-Use the provided relevant context from the candidate's background to craft a specific, compelling answer.
-
-Guidelines:
-- Keep answers concise (2-3 sentences)
-- Reference specific experiences when relevant
-- Be honest and authentic
-- Show enthusiasm for the role"""
-
-        user_prompt = f"""Question: {request.question}
-
-{'Job: ' + request.job_title if request.job_title else ''}
-{'Company: ' + request.company if request.company else ''}
-
-Relevant Background Context:
-{context_str}
-
-Based on the above context, provide a compelling answer to the question:"""
-
-        # 4. Generate answer
-        answer = await ollama.generate(
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            temperature=0.7,
-            max_tokens=300
+        # 3. Count RAG chunks
+        num_chunks = (
+            len(retrieved.get('experiences', [])) +
+            len(retrieved.get('projects', [])) +
+            len(retrieved.get('skills', [])) +
+            len(retrieved.get('qa_pairs', []))
+        )
+        
+        # 4. Prepare user profile with RAG context
+        user_profile = {
+            "full_name": kb.full_name,
+            "summary": context_str,  # Use RAG context instead of full summary
+            "work_experience": retrieved.get('experiences', []),
+            "projects": retrieved.get('projects', []),
+            "skills": retrieved.get('skills', []),
+            "qa_pairs": retrieved.get('qa_pairs', [])
+        }
+        
+        job_details = {
+            "title": request.job_title or "",
+            "company": request.company or ""
+        }
+        
+        # 5. Generate answer with tracking (RAG enabled)
+        answer = await ollama_tracker.answer_job_question_with_tracking(
+            question=request.question,
+            user_profile=user_profile,
+            job_details=job_details,
+            db=db,
+            user_id=request.user_id,
+            rag_chunks=num_chunks  # ← IMPORTANT: Marks this as RAG operation
         )
         
         return {
@@ -227,8 +206,6 @@ Based on the above context, provide a compelling answer to the question:"""
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await ollama.close()
 
 
 @router.delete("/index/{kb_id}")
