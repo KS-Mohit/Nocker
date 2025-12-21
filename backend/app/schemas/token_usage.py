@@ -46,7 +46,7 @@ class TokenUsageResponse(TokenUsageBase):
     success: bool
     error_message: Optional[str] = None
     estimated_cost: Optional[float] = None
-    metadata: Optional[Dict[str, Any]] = None
+    extra_metadata: Optional[Dict[str, Any]] = None
     created_at: datetime
 
     class Config:
