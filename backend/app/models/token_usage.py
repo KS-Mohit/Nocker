@@ -29,6 +29,10 @@ class TokenUsage(Base):
     completion_tokens = Column(Integer, nullable=False, default=0)
     total_tokens = Column(Integer, nullable=False, default=0)
     
+    # Store actual text for evaluation
+    prompt_text = Column(Text, nullable=True)
+    completion_text = Column(Text, nullable=True)
+    
     # Context information
     rag_used = Column(String, nullable=True)
     rag_chunks_retrieved = Column(Integer, nullable=True)

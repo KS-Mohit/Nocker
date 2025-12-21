@@ -100,6 +100,8 @@ class TokenTracker:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                prompt_text=prompt[:5000],  # Store first 5000 chars
+                completion_text=completion[:5000], 
                 rag_used='true' if rag_used else 'false',
                 rag_chunks_retrieved=rag_chunks,
                 context_length=len(prompt),
