@@ -82,3 +82,6 @@ playwright/.auth/
 test-results/
 playwright-report/
 *.pem
+
+# personal docs 
+sunil_docs/*
