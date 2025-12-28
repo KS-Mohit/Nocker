@@ -1,6 +1,9 @@
 version: "3.8"
 
 services:
+  # ===========================================================================
+  # PostgreSQL Database
+  # ===========================================================================
   postgres:
     image: postgres:16-alpine
     container_name: job_agent_postgres
@@ -18,7 +21,12 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - job_agent_network
 
+  # ===========================================================================
+  # Qdrant Vector Database
+  # ===========================================================================
   qdrant:
     image: qdrant/qdrant:latest
     container_name: job_agent_qdrant
@@ -27,7 +35,55 @@ services:
       - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
+    networks:
+      - job_agent_network
+
+  # ===========================================================================
+  # Playwright MCP Server (Browser Automation) 
+  # ===========================================================================
+  # NOTE: This runs in HEADLESS mode only (no visible browser)
+  # For development with visible browser, run MCP locally instead:
+  #   npx @playwright/mcp@latest --port 8931 --user-data-dir ./browser-data
+  # ===========================================================================
+  playwright-mcp:
+    image: mcr.microsoft.com/playwright/mcp:latest
+    container_name: job_agent_playwright_mcp
+    ports:
+      - "8931:8931"
+    command: >
+      --headless
+      --browser chromium
+      --no-sandbox
+      --port 8931
+      --viewport-size 1920x1080
+    volumes:
+      # Persist browser session data (cookies, localStorage, etc.)
+      - playwright_data:/data/browser-data
+      # Output directory for screenshots
+      - ./screenshots:/data/screenshots
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8931/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - job_agent_network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
 
 volumes:
   postgres_data:
   qdrant_data:
+  playwright_data:
+
+networks:
+  job_agent_network:
+    driver: bridge
