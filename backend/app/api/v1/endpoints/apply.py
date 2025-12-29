@@ -70,6 +70,15 @@ class ApplyRequest(BaseModel):
         }
     )
     
+    # Resume path for upload
+    resume_path: Optional[str] = Field(
+        None,
+        description="Absolute path to resume file (PDF, DOC, DOCX)",
+        json_schema_extra={
+            "example": "C:\\Users\\YourName\\Documents\\resume.pdf"
+        }
+    )
+    
     # Options
     dry_run: bool = Field(
         True,
@@ -91,6 +100,7 @@ class ApplyRequest(BaseModel):
             "example": {
                 "job_url": "https://www.linkedin.com/jobs/view/123456789/",
                 "kb_id": 1,
+                "resume_path": "C:\\Users\\YourName\\Documents\\resume.pdf",
                 "dry_run": True,
                 "use_claude": True
             }
@@ -205,11 +215,11 @@ async def apply_to_job(request: ApplyRequest):
     user_profile = request.user_profile
     if request.kb_id:
         # Load from database
-        from app.db.session import get_db
+        from app.db.session import async_session
         from sqlalchemy import select
         from app.models.knowledge_base import KnowledgeBase
         
-        async for db in get_db():
+        async with async_session() as db:
             result = await db.execute(
                 select(KnowledgeBase).where(KnowledgeBase.id == request.kb_id)
             )
@@ -235,7 +245,6 @@ async def apply_to_job(request: ApplyRequest):
                 "projects": kb.projects or [],
                 "qa_pairs": kb.qa_pairs or {}
             }
-            break
     
     # Get job details
     job_details = request.job_details or {}
@@ -251,6 +260,11 @@ async def apply_to_job(request: ApplyRequest):
     if request.use_claude and not claude_api_key:
         logger.warning("ANTHROPIC_API_KEY not set, falling back to Ollama")
     
+    # Get resume path from request or knowledge base
+    resume_path = request.resume_path
+    if not resume_path and user_profile.get("resume_path"):
+        resume_path = user_profile.get("resume_path")
+    
     # Create service
     service = UniversalFormService(
         use_claude=request.use_claude and bool(claude_api_key),
@@ -264,7 +278,8 @@ async def apply_to_job(request: ApplyRequest):
         job_details=job_details,
         kb_id=request.kb_id,
         dry_run=request.dry_run,
-        max_pages=request.max_pages
+        max_pages=request.max_pages,
+        resume_path=resume_path
     )
     
     # Determine site type

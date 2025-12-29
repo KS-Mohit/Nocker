@@ -37,7 +37,7 @@ class NavigateRequest(BaseModel):
 class ClickRequest(BaseModel):
     """Request to click element"""
     element: str = Field(..., description="Human-readable element description")
-    ref: str = Field(..., description="Element reference from snapshot (e.g., 'ref=s1e45')")
+    ref: str = Field(..., description="CSS selector for the element")
 
 
 class TypeRequest(BaseModel):
@@ -46,6 +46,12 @@ class TypeRequest(BaseModel):
     ref: str
     text: str
     submit: bool = False
+
+
+class UploadRequest(BaseModel):
+    """Request to upload a file"""
+    selector: str = Field(default="input[type='file']", description="CSS selector for file input")
+    file_path: str = Field(..., description="Absolute path to the file to upload")
 
 
 class SnapshotResponse(BaseModel):
@@ -61,14 +67,7 @@ class SnapshotResponse(BaseModel):
 
 @router.get("/health", response_model=MCPHealthResponse)
 async def check_mcp_health():
-    """
-    Check if the Playwright MCP server is running and healthy.
-    
-    The MCP server should be started separately with:
-    ```
-    npx @playwright/mcp@latest --port 8931 --user-data-dir ./browser-data
-    ```
-    """
+    """Check if the Playwright MCP server is running and healthy."""
     client = get_mcp_client()
     
     try:
@@ -118,22 +117,15 @@ async def list_mcp_tools():
 
 @router.post("/login-check")
 async def check_linkedin_login():
-    """
-    Check if we're currently logged into LinkedIn.
-    
-    Navigates to LinkedIn and checks for logged-in indicators.
-    """
+    """Check if we're currently logged into LinkedIn."""
     client = get_mcp_client()
     
     try:
-        # Navigate to LinkedIn
         await client.navigate("https://www.linkedin.com/feed/")
         await client.wait_for(time=2)
         
-        # Get snapshot
         snapshot = await client.get_snapshot()
         
-        # Check for login indicators
         logged_in_indicators = ["messaging", "my network", "notifications", "home"]
         logged_out_indicators = ["sign in", "join now", "log in"]
         
@@ -183,12 +175,7 @@ async def navigate_browser(request: NavigateRequest):
 
 @router.get("/snapshot", response_model=SnapshotResponse)
 async def get_page_snapshot():
-    """
-    Get the accessibility snapshot of the current page.
-    
-    This returns a structured text representation of the page that
-    includes all interactive elements with their refs for automation.
-    """
+    """Get the visible text content of the current page."""
     client = get_mcp_client()
     result = await client.get_snapshot()
     
@@ -201,7 +188,7 @@ async def get_page_snapshot():
 
 @router.post("/click")
 async def click_element(request: ClickRequest):
-    """Click on an element by its ref"""
+    """Click on an element by CSS selector"""
     client = get_mcp_client()
     result = await client.click(
         element=request.element,
@@ -224,6 +211,22 @@ async def type_text(request: TypeRequest):
         ref=request.ref,
         text=request.text,
         submit=request.submit
+    )
+    
+    return {
+        "success": result.success,
+        "content": result.content,
+        "error": result.error
+    }
+
+
+@router.post("/upload")
+async def upload_file(request: UploadRequest):
+    """Upload a file to a file input element"""
+    client = get_mcp_client()
+    result = await client.upload_file(
+        selector=request.selector,
+        file_path=request.file_path
     )
     
     return {
@@ -267,9 +270,7 @@ async def close_browser():
 
 @router.get("/setup-guide")
 async def get_setup_guide():
-    """
-    Get instructions for setting up the Playwright MCP server.
-    """
+    """Get instructions for setting up the Playwright MCP server."""
     return {
         "title": "Playwright MCP Server Setup Guide",
         "steps": [
@@ -281,36 +282,15 @@ async def get_setup_guide():
             },
             {
                 "step": 2,
-                "title": "Start MCP Server (Development)",
-                "description": "Run in a separate terminal with persistent profile",
-                "command": "npx @playwright/mcp@latest --port 8931 --user-data-dir ./browser-data"
+                "title": "Start MCP Server",
+                "description": "Run in a separate terminal",
+                "command": "npx @executeautomation/playwright-mcp-server --port 8931"
             },
             {
                 "step": 3,
-                "title": "Start MCP Server (Headless)",
-                "description": "For servers without display",
-                "command": "npx @playwright/mcp@latest --port 8931 --headless --user-data-dir ./browser-data"
-            },
-            {
-                "step": 4,
                 "title": "Verify Server",
                 "description": "Check if server is running",
                 "endpoint": "GET /api/v1/mcp/health"
-            },
-            {
-                "step": 5,
-                "title": "Login to LinkedIn (Manual)",
-                "description": "Navigate to LinkedIn and login manually once. Session will be saved.",
-                "tip": "Use POST /api/v1/mcp/navigate with url='https://www.linkedin.com/login'"
             }
-        ],
-        "configuration": {
-            "server_url": "http://localhost:8931",
-            "persistent_profile": "./browser-data",
-            "recommended_flags": [
-                "--port 8931",
-                "--user-data-dir ./browser-data",
-                "--viewport-size 1920x1080"
-            ]
-        }
+        ]
     }

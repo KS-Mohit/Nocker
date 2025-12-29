@@ -1,84 +1,36 @@
 """
-Universal Form Filler Service
+Universal Form Filler Service - Claude AI Only
 
-Works with ANY job application website, not just LinkedIn.
-Uses MCP for browser automation and supports multiple LLM providers.
-
-Supported Sites:
-- LinkedIn (Easy Apply)
-- Indeed
-- Glassdoor
-- Lever
-- Greenhouse
-- Workday
-- Any custom career page
+Uses Claude to:
+1. Analyze pages and find correct selectors
+2. Fill form fields intelligently
+3. Answer application questions based on user profile
+4. Handle multi-page forms automatically
 """
 
 import re
 import json
 import asyncio
-from typing import Dict, List, Optional, Any, Tuple, Callable
+import os
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
-from abc import ABC, abstractmethod
 from loguru import logger
+import anthropic
 
 from app.services.mcp.mcp_client import MCPClient, MCPResponse, get_mcp_client
-from app.services.rag.rag_service import RAGService, get_rag_service
 
 
 class JobSite(str, Enum):
-    """Supported job application sites"""
     LINKEDIN = "linkedin"
     INDEED = "indeed"
-    GLASSDOOR = "glassdoor"
-    LEVER = "lever"
-    GREENHOUSE = "greenhouse"
-    WORKDAY = "workday"
-    GENERIC = "generic"  # Fallback for unknown sites
-
-
-class FormFieldType(str, Enum):
-    """Types of form fields"""
-    TEXT = "text"
-    TEXTAREA = "textarea"
-    SELECT = "select"
-    RADIO = "radio"
-    CHECKBOX = "checkbox"
-    FILE = "file"
-    DATE = "date"
-    PHONE = "phone"
-    EMAIL = "email"
-
-
-@dataclass
-class FormField:
-    """Represents a form field extracted from page snapshot"""
-    ref: str
-    field_type: FormFieldType
-    label: str
-    required: bool = False
-    options: List[str] = field(default_factory=list)
-    current_value: str = ""
-    placeholder: str = ""
-
-
-@dataclass 
-class FormPage:
-    """Represents a page/step in a multi-page form"""
-    page_number: int
-    fields: List[FormField]
-    has_next: bool = False
-    has_submit: bool = False
-    next_button_ref: Optional[str] = None
-    submit_button_ref: Optional[str] = None
+    GENERIC = "generic"
 
 
 @dataclass
 class ApplicationResult:
-    """Result of a form submission attempt"""
     success: bool
-    status: str  # "submitted", "needs_review", "failed", "in_progress"
+    status: str
     message: str
     form_responses: Dict[str, str] = field(default_factory=dict)
     screenshots: List[str] = field(default_factory=list)
@@ -86,384 +38,181 @@ class ApplicationResult:
     pages_processed: int = 0
 
 
-# =============================================================================
-# LLM Provider Interface
-# =============================================================================
-
-class LLMProvider(ABC):
-    """Abstract base class for LLM providers"""
-    
-    @abstractmethod
-    async def generate(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-        max_tokens: int = 500
-    ) -> str:
-        """Generate text completion"""
-        pass
-    
-    @abstractmethod
-    async def analyze_form(
-        self,
-        snapshot: str,
-        user_profile: Dict,
-        job_details: Dict
-    ) -> List[Dict]:
-        """Analyze form and return field mappings"""
-        pass
-
-
-class ClaudeProvider(LLMProvider):
-    """Claude API provider - RECOMMENDED for production"""
-    
-    def __init__(self, api_key: Optional[str] = None):
-        import anthropic
-        self.client = anthropic.AsyncAnthropic(api_key=api_key)
-        self.model = "claude-sonnet-4-20250514"
-    
-    async def generate(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-        max_tokens: int = 500
-    ) -> str:
-        try:
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system_prompt or "You are a helpful assistant.",
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return message.content[0].text
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
-            raise
-    
-    async def analyze_form(
-        self,
-        snapshot: str,
-        user_profile: Dict,
-        job_details: Dict
-    ) -> List[Dict]:
-        """Use Claude to analyze form and map fields to user data"""
-        
-        system_prompt = """You are an expert at analyzing web form accessibility snapshots and mapping form fields to user profile data.
-
-Given a page snapshot and user profile, identify all fillable form fields and determine the appropriate value for each.
-
-Return a JSON array of field mappings. Each mapping should have:
-- ref: The element reference (e.g., "ref=s1e45")
-- label: The field label/question
-- value: The value to fill (from user profile or generated)
-- field_type: One of "text", "select", "radio", "checkbox", "textarea"
-- confidence: Your confidence in the mapping (high, medium, low)
-
-For custom questions (not direct profile fields), generate professional, concise answers."""
-
-        prompt = f"""Analyze this form and provide field mappings.
-
-PAGE SNAPSHOT:
-{snapshot[:8000]}  # Truncate to stay within limits
-
-USER PROFILE:
-{json.dumps(user_profile, indent=2)[:3000]}
-
-JOB DETAILS:
-Title: {job_details.get('title', 'Unknown')}
-Company: {job_details.get('company', 'Unknown')}
-Description: {job_details.get('description', '')[:1000]}
-
-Return ONLY a valid JSON array of field mappings. No explanation, just JSON."""
-
-        response = await self.generate(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            max_tokens=2000
-        )
-        
-        # Parse JSON from response
-        try:
-            # Clean up response (remove markdown code blocks if present)
-            clean_response = response.strip()
-            if clean_response.startswith("```"):
-                clean_response = re.sub(r'^```\w*\n?', '', clean_response)
-                clean_response = re.sub(r'\n?```$', '', clean_response)
-            
-            return json.loads(clean_response)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Claude response as JSON: {e}")
-            logger.debug(f"Response was: {response[:500]}")
-            return []
-
-
-class OllamaProvider(LLMProvider):
-    """Ollama local LLM provider - FREE but lower quality"""
-    
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama3"):
-        import httpx
-        self.client = httpx.AsyncClient(timeout=120.0)
-        self.base_url = base_url
-        self.model = model
-    
-    async def generate(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-        max_tokens: int = 500
-    ) -> str:
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"num_predict": max_tokens}
-        }
-        if system_prompt:
-            payload["system"] = system_prompt
-        
-        response = await self.client.post(
-            f"{self.base_url}/api/generate",
-            json=payload
-        )
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
-    
-    async def analyze_form(
-        self,
-        snapshot: str,
-        user_profile: Dict,
-        job_details: Dict
-    ) -> List[Dict]:
-        """Use Ollama to analyze form - simpler prompt for local model"""
-        
-        prompt = f"""You are filling out a job application form.
-
-FORM FIELDS (from accessibility snapshot):
-{snapshot[:4000]}
-
-USER INFO:
-Name: {user_profile.get('full_name')}
-Email: {user_profile.get('email')}
-Phone: {user_profile.get('phone')}
-Location: {user_profile.get('location')}
-
-For each empty form field, provide the value to fill.
-Return JSON array: [{{"ref": "ref=xxx", "label": "field name", "value": "value to fill"}}]
-
-JSON ONLY:"""
-
-        response = await self.generate(prompt, max_tokens=1500)
-        
-        try:
-            clean = response.replace("```json", "").replace("```", "").strip()
-            return json.loads(clean)
-        except:
-            return []
-
-
-# =============================================================================
-# Site-Specific Handlers
-# =============================================================================
-
-class SiteHandler(ABC):
-    """Base class for site-specific form handling"""
-    
-    @abstractmethod
-    def detect(self, url: str, snapshot: str) -> bool:
-        """Check if this handler should be used for the given page"""
-        pass
-    
-    @abstractmethod
-    def find_apply_button(self, snapshot: str) -> Optional[str]:
-        """Find the apply/submit button reference"""
-        pass
-    
-    @abstractmethod
-    def find_navigation_buttons(self, snapshot: str) -> Tuple[Optional[str], Optional[str]]:
-        """Find next and submit button references"""
-        pass
-    
-    @abstractmethod
-    def is_success_page(self, snapshot: str) -> bool:
-        """Check if we're on a success/confirmation page"""
-        pass
-
-
-class LinkedInHandler(SiteHandler):
-    """Handler for LinkedIn Easy Apply"""
-    
-    def detect(self, url: str, snapshot: str) -> bool:
-        return "linkedin.com" in url.lower()
-    
-    def find_apply_button(self, snapshot: str) -> Optional[str]:
-        patterns = [
-            r'button "Easy Apply".*?\[ref=([^\]]+)\]',
-            r'button.*?Easy Apply.*?\[ref=([^\]]+)\]',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, snapshot, re.IGNORECASE)
-            if match:
-                return f"ref={match.group(1)}"
-        return None
-    
-    def find_navigation_buttons(self, snapshot: str) -> Tuple[Optional[str], Optional[str]]:
-        next_ref = None
-        submit_ref = None
-        
-        # Find Submit
-        submit_match = re.search(r'button "Submit.*?".*?\[ref=([^\]]+)\]', snapshot, re.I)
-        if submit_match:
-            submit_ref = f"ref={submit_match.group(1)}"
-        
-        # Find Next
-        next_match = re.search(r'button "(Next|Continue|Review)".*?\[ref=([^\]]+)\]', snapshot, re.I)
-        if next_match:
-            next_ref = f"ref={next_match.group(2)}"
-        
-        return next_ref, submit_ref
-    
-    def is_success_page(self, snapshot: str) -> bool:
-        indicators = ["application sent", "application submitted", "application complete"]
-        return any(ind in snapshot.lower() for ind in indicators)
-
-
-class IndeedHandler(SiteHandler):
-    """Handler for Indeed applications"""
-    
-    def detect(self, url: str, snapshot: str) -> bool:
-        return "indeed.com" in url.lower()
-    
-    def find_apply_button(self, snapshot: str) -> Optional[str]:
-        patterns = [
-            r'button "Apply.*?".*?\[ref=([^\]]+)\]',
-            r'link "Apply.*?".*?\[ref=([^\]]+)\]',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, snapshot, re.IGNORECASE)
-            if match:
-                return f"ref={match.group(1)}"
-        return None
-    
-    def find_navigation_buttons(self, snapshot: str) -> Tuple[Optional[str], Optional[str]]:
-        next_ref = None
-        submit_ref = None
-        
-        submit_match = re.search(r'button "(Submit|Apply|Send)".*?\[ref=([^\]]+)\]', snapshot, re.I)
-        if submit_match:
-            submit_ref = f"ref={submit_match.group(2)}"
-        
-        next_match = re.search(r'button "(Continue|Next)".*?\[ref=([^\]]+)\]', snapshot, re.I)
-        if next_match:
-            next_ref = f"ref={next_match.group(2)}"
-        
-        return next_ref, submit_ref
-    
-    def is_success_page(self, snapshot: str) -> bool:
-        indicators = ["application submitted", "thank you for applying", "application received"]
-        return any(ind in snapshot.lower() for ind in indicators)
-
-
-class GenericHandler(SiteHandler):
-    """Generic handler for unknown sites"""
-    
-    def detect(self, url: str, snapshot: str) -> bool:
-        return True  # Fallback handler
-    
-    def find_apply_button(self, snapshot: str) -> Optional[str]:
-        patterns = [
-            r'button "(Apply|Submit Application|Start Application)".*?\[ref=([^\]]+)\]',
-            r'link "(Apply|Apply Now|Submit)".*?\[ref=([^\]]+)\]',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, snapshot, re.IGNORECASE)
-            if match:
-                return f"ref={match.group(2)}"
-        return None
-    
-    def find_navigation_buttons(self, snapshot: str) -> Tuple[Optional[str], Optional[str]]:
-        next_ref = None
-        submit_ref = None
-        
-        # Generic submit patterns
-        submit_match = re.search(r'button "(Submit|Apply|Send|Finish)".*?\[ref=([^\]]+)\]', snapshot, re.I)
-        if submit_match:
-            submit_ref = f"ref={submit_match.group(2)}"
-        
-        # Generic next patterns
-        next_match = re.search(r'button "(Next|Continue|Proceed|Save.*Continue)".*?\[ref=([^\]]+)\]', snapshot, re.I)
-        if next_match:
-            next_ref = f"ref={next_match.group(2)}"
-        
-        return next_ref, submit_ref
-    
-    def is_success_page(self, snapshot: str) -> bool:
-        indicators = [
-            "thank you",
-            "application submitted",
-            "application received",
-            "we received your application",
-            "application complete",
-            "successfully submitted"
-        ]
-        return any(ind in snapshot.lower() for ind in indicators)
-
-
-# =============================================================================
-# Universal Form Service
-# =============================================================================
-
 class UniversalFormService:
     """
-    Universal form filler that works with any job application website.
-    
-    Features:
-    - Auto-detects job site type
-    - Uses appropriate handler for each site
-    - Supports multiple LLM providers (Claude, Ollama)
-    - Uses RAG for context retrieval
-    - Handles multi-page forms
+    Fully automated job application service using Claude AI.
     """
-    
-    # Site handlers in order of priority
-    HANDLERS = [
-        LinkedInHandler(),
-        IndeedHandler(),
-        GenericHandler(),  # Fallback
-    ]
     
     def __init__(
         self,
         mcp_client: Optional[MCPClient] = None,
-        llm_provider: Optional[LLMProvider] = None,
-        rag_service: Optional[RAGService] = None,
-        use_claude: bool = True,  # Default to Claude for better quality
-        claude_api_key: Optional[str] = None
+        claude_api_key: Optional[str] = None,
+        **kwargs
     ):
         self.mcp = mcp_client or get_mcp_client()
-        self.rag = rag_service or get_rag_service()
         
-        # Initialize LLM provider
-        if llm_provider:
-            self.llm = llm_provider
-        elif use_claude:
-            self.llm = ClaudeProvider(api_key=claude_api_key)
-            logger.info("Using Claude API for form analysis")
-        else:
-            self.llm = OllamaProvider()
-            logger.info("Using Ollama (local) for form analysis")
+        from dotenv import load_dotenv
+        load_dotenv()
         
-        # State
-        self.current_handler: Optional[SiteHandler] = None
+        api_key = claude_api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            logger.error("ANTHROPIC_API_KEY not found in environment")
+            raise ValueError("ANTHROPIC_API_KEY is required. Set it in .env file or pass claude_api_key parameter")
+        
+        self.claude = anthropic.AsyncAnthropic(api_key=api_key)
+        self.model = "claude-sonnet-4-20250514"
+        
         self.form_responses: Dict[str, str] = {}
         self.screenshots: List[str] = []
+        self.current_handler = None
+        
+        logger.info("Using Claude AI for intelligent form automation")
     
-    def _detect_site(self, url: str, snapshot: str) -> SiteHandler:
-        """Detect which site we're on and return appropriate handler"""
-        for handler in self.HANDLERS:
-            if handler.detect(url, snapshot):
-                logger.info(f"Detected site type: {handler.__class__.__name__}")
-                return handler
-        return GenericHandler()
+    async def _ask_claude(self, prompt: str, system: str = None, max_tokens: int = 1000) -> str:
+        """Ask Claude a question"""
+        try:
+            response = await self.claude.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system or "You are a helpful assistant.",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.content[0].text
+        except Exception as e:
+            logger.error(f"Claude API error: {e}")
+            raise
+    
+    async def _get_html(self) -> str:
+        """Get page HTML for Claude to analyze"""
+        result = await self.mcp.call_tool("playwright_get_visible_html", {
+            "removeScripts": True,
+            "removeStyles": True,
+            "maxLength": 15000
+        })
+        return result.content if result.success else ""
+    
+    async def _analyze_and_click(self, target_description: str, html: str = None) -> bool:
+        """Use Claude to find and click the right element"""
+        if not html:
+            html = await self._get_html()
+        
+        prompt = f"""Analyze this HTML and find the CSS selector for: {target_description}
+
+HTML:
+{html[:12000]}
+
+Return ONLY a JSON object with:
+- "selector": the CSS selector to click (be specific, prefer classes and IDs)
+- "found": true/false
+
+Examples of good selectors:
+- "button.jobs-apply-button" for LinkedIn Easy Apply
+- "button[aria-label*='Next']" for Next buttons
+- "button.artdeco-button--primary" for primary buttons
+
+JSON only, no explanation:"""
+
+        response = await self._ask_claude(prompt, max_tokens=200)
+        
+        try:
+            clean = response.strip()
+            if clean.startswith("```"):
+                clean = re.sub(r'^```\w*\n?', '', clean)
+                clean = re.sub(r'\n?```$', '', clean)
+            
+            data = json.loads(clean)
+            
+            if data.get("found") and data.get("selector"):
+                selector = data["selector"]
+                logger.info(f"Claude found selector: {selector}")
+                
+                result = await self.mcp.click(element=target_description, ref=selector)
+                return result.success
+        except Exception as e:
+            logger.error(f"Failed to parse Claude response: {e}")
+        
+        return False
+    
+    async def _analyze_and_fill_form(self, html: str, user_profile: Dict, job_details: Dict) -> List[Dict]:
+        """Use Claude to analyze form and determine what to fill"""
+        
+        system = """You are an expert at filling job application forms. 
+Analyze the HTML and return a JSON array of form fields to fill.
+
+For each field, provide:
+- "selector": CSS selector for the input
+- "value": value to fill from the user profile
+- "type": "text", "select", or "click"
+- "label": field label for logging
+
+Be smart about matching:
+- Phone fields get phone number (without country code if separate)
+- Email fields get email
+- Name fields get appropriate name parts
+- Experience questions get relevant years based on profile
+- Use the user's actual data, don't make things up
+
+Return ONLY valid JSON array."""
+
+        prompt = f"""Analyze this form and provide field mappings.
+
+HTML:
+{html[:10000]}
+
+USER PROFILE:
+Name: {user_profile.get('full_name', 'N/A')}
+Email: {user_profile.get('email', 'N/A')}
+Phone: {user_profile.get('phone', 'N/A')}
+Location: {user_profile.get('location', 'N/A')}
+LinkedIn: {user_profile.get('linkedin_url', 'N/A')}
+Summary: {user_profile.get('summary', 'N/A')[:500] if user_profile.get('summary') else 'N/A'}
+Skills: {', '.join(user_profile.get('skills', [])[:15])}
+Experience: {json.dumps(user_profile.get('work_experience', [])[:2], default=str)[:1000]}
+
+JOB:
+Title: {job_details.get('title', 'Unknown')}
+Company: {job_details.get('company', 'Unknown')}
+
+Return JSON array of fields to fill:"""
+
+        response = await self._ask_claude(prompt, system=system, max_tokens=2000)
+        
+        try:
+            clean = response.strip()
+            if clean.startswith("```"):
+                clean = re.sub(r'^```\w*\n?', '', clean)
+                clean = re.sub(r'\n?```$', '', clean)
+            
+            return json.loads(clean)
+        except Exception as e:
+            logger.error(f"Failed to parse form analysis: {e}")
+            return []
+
+    async def _answer_question(self, question: str, user_profile: Dict, job_details: Dict) -> str:
+        """Use Claude to generate an answer for application questions"""
+        
+        system = """You are helping fill out a job application. 
+Give concise, professional answers based on the user's profile.
+For years of experience questions, return just a number.
+For yes/no questions, return just "Yes" or "No".
+For text questions, keep answers brief (1-2 sentences max)."""
+
+        prompt = f"""Answer this job application question based on the user profile.
+
+QUESTION: {question}
+
+USER PROFILE:
+Name: {user_profile.get('full_name', 'N/A')}
+Skills: {', '.join(user_profile.get('skills', [])[:10])}
+Experience: {json.dumps(user_profile.get('work_experience', [])[:2], default=str)[:800]}
+Education: {json.dumps(user_profile.get('education', [])[:1], default=str)[:300]}
+
+JOB: {job_details.get('title', 'Unknown')} at {job_details.get('company', 'Unknown')}
+
+Answer (be concise):"""
+
+        response = await self._ask_claude(prompt, system=system, max_tokens=200)
+        return response.strip()
     
     async def apply_to_job(
         self,
@@ -472,253 +221,186 @@ class UniversalFormService:
         job_details: Dict,
         kb_id: Optional[int] = None,
         dry_run: bool = True,
-        max_pages: int = 15
+        max_pages: int = 10,
+        resume_path: Optional[str] = None
     ) -> ApplicationResult:
         """
-        Apply to a job at any supported site.
-        
-        Args:
-            job_url: URL of the job posting
-            user_profile: User's profile data
-            job_details: Job details (title, company, description)
-            kb_id: Knowledge base ID for RAG (optional)
-            dry_run: If True, won't click final submit
-            max_pages: Maximum form pages to process
+        Fully automated job application using Claude AI.
         """
-        logger.info(f"🚀 Starting application: {job_details.get('title')} at {job_details.get('company')}")
-        logger.info(f"📍 URL: {job_url}")
+        logger.info(f"Starting application: {job_details.get('title')} at {job_details.get('company')}")
+        logger.info(f"URL: {job_url}")
         
         try:
-            # 1. Health check
+            # Health check
             if not await self.mcp.health_check():
                 return ApplicationResult(
-                    success=False,
-                    status="failed",
+                    success=False, status="failed",
                     message="MCP Server not available",
-                    error="Start the MCP server: npx @playwright/mcp@latest --port 8931"
+                    error="Start MCP: npx @executeautomation/playwright-mcp-server --port 8931"
                 )
             
-            # 2. Navigate to job page
+            # Navigate to job
+            logger.info("Navigating to job page...")
             nav_result = await self.mcp.navigate(job_url)
             if not nav_result.success:
                 return ApplicationResult(
-                    success=False,
-                    status="failed",
-                    message="Failed to navigate to job page",
-                    error=nav_result.error
+                    success=False, status="failed",
+                    message="Failed to navigate", error=nav_result.error
                 )
             
-            await self.mcp.wait_for(time=2)
+            await self.mcp.wait_for(time=3)
             
-            # 3. Get initial snapshot and detect site
-            snapshot = await self.mcp.get_snapshot()
-            self.current_handler = self._detect_site(job_url, snapshot.content)
+            # Get page HTML for Claude to analyze
+            logger.info("Claude analyzing page to find apply button...")
+            html = await self._get_html()
             
-            # 4. Find and click apply button
-            apply_ref = self.current_handler.find_apply_button(snapshot.content)
-            if not apply_ref:
-                await self.mcp.take_screenshot(filename="debug_no_apply_button.png")
+            # Use Claude to find and click the Apply button
+            clicked = await self._analyze_and_click(
+                "Apply button - this could be 'Easy Apply', 'Apply Now', 'Apply', 'Submit Application', or similar button to start the job application process",
+                html
+            )
+            
+            if not clicked:
                 return ApplicationResult(
-                    success=False,
-                    status="failed",
-                    message="Apply button not found",
-                    error="Could not find apply button on this page",
-                    screenshots=["debug_no_apply_button.png"]
+                    success=False, status="failed",
+                    message="Could not find apply button",
+                    error="Claude couldn't identify the apply button. Try a different job posting."
                 )
             
-            await self.mcp.click(element="Apply button", ref=apply_ref)
             await self.mcp.wait_for(time=2)
-            logger.info("✅ Apply button clicked, starting form...")
+            logger.info("Apply button clicked")
             
-            # 5. Process form pages
+            # Process form pages
             for page_num in range(1, max_pages + 1):
-                logger.info(f"📄 Processing page {page_num}...")
+                logger.info(f"Processing page {page_num}...")
+                await self.mcp.wait_for(time=1.5)
                 
-                # Get current page snapshot
-                snapshot = await self.mcp.get_snapshot()
-                snapshot_text = snapshot.content
+                html = await self._get_html()
+                text_result = await self.mcp.get_snapshot()
+                page_text = text_result.content or ""
                 
                 # Check for success
-                if self.current_handler.is_success_page(snapshot_text):
+                if any(x in page_text.lower() for x in ["application sent", "application submitted", "application complete"]):
+                    logger.info("Application submitted successfully")
                     return ApplicationResult(
-                        success=True,
-                        status="submitted",
+                        success=True, status="submitted",
                         message="Application submitted successfully!",
                         form_responses=self.form_responses,
-                        screenshots=self.screenshots,
                         pages_processed=page_num
                     )
                 
-                # Use LLM to analyze form and get field mappings
-                field_mappings = await self._get_field_mappings(
-                    snapshot_text,
-                    user_profile,
-                    job_details,
-                    kb_id
-                )
+                # Check if on review page
+                is_review_page = "review your application" in page_text.lower() or "submit application" in page_text.lower()
                 
-                # Fill each field
-                for mapping in field_mappings:
-                    await self._fill_field(mapping)
-                
-                # Find navigation buttons
-                next_ref, submit_ref = self.current_handler.find_navigation_buttons(snapshot_text)
-                
-                if submit_ref:
+                if is_review_page:
                     if dry_run:
-                        logger.info("🛑 DRY RUN: Would submit here")
-                        await self.mcp.take_screenshot(filename="final_review.png")
+                        logger.info("DRY RUN: Stopping at review page")
                         return ApplicationResult(
-                            success=True,
-                            status="needs_review",
-                            message="Dry run complete. Ready to submit.",
+                            success=True, status="needs_review",
+                            message="Dry run complete - ready to submit!",
                             form_responses=self.form_responses,
-                            screenshots=self.screenshots + ["final_review.png"],
                             pages_processed=page_num
                         )
                     else:
-                        logger.info("📤 Submitting application...")
-                        await self.mcp.click(element="Submit button", ref=submit_ref)
+                        logger.info("Submitting application...")
+                        await self._analyze_and_click("Submit application button", html)
                         await self.mcp.wait_for(time=3)
                         
-                        # Verify submission
-                        final_snapshot = await self.mcp.get_snapshot()
-                        if self.current_handler.is_success_page(final_snapshot.content):
-                            return ApplicationResult(
-                                success=True,
-                                status="submitted",
-                                message="Application submitted!",
-                                form_responses=self.form_responses,
-                                screenshots=self.screenshots,
-                                pages_processed=page_num
-                            )
+                        return ApplicationResult(
+                            success=True, status="submitted",
+                            message="Application submitted!",
+                            form_responses=self.form_responses,
+                            pages_processed=page_num
+                        )
                 
-                elif next_ref:
-                    logger.info("➡️ Moving to next page...")
-                    await self.mcp.click(element="Next button", ref=next_ref)
-                    await self.mcp.wait_for(time=1.5)
+                # Handle resume upload
+                if "upload resume" in page_text.lower() or "resume" in page_text.lower()[:500]:
+                    if resume_path:
+                        logger.info(f"Uploading resume: {resume_path}")
+                        upload_result = await self.mcp.upload_file(
+                            selector="input[type='file']",
+                            file_path=resume_path
+                        )
+                        if upload_result.success:
+                            logger.info("Resume uploaded")
+                        else:
+                            logger.warning(f"Resume upload may need manual intervention: {upload_result.error}")
+                    else:
+                        logger.warning("Resume required but no path provided")
                 
-                else:
-                    # No navigation found - try Enter key
-                    logger.warning("No navigation button found, pressing Enter...")
-                    await self.mcp.press_key("Enter")
-                    await self.mcp.wait_for(time=1.5)
+                # Use Claude to analyze and fill form fields
+                logger.info("Claude analyzing form fields...")
+                field_mappings = await self._analyze_and_fill_form(html, user_profile, job_details)
+                
+                for mapping in field_mappings:
+                    selector = mapping.get("selector", "")
+                    value = mapping.get("value", "")
+                    field_type = mapping.get("type", "text")
+                    label = mapping.get("label", "Unknown field")
+                    
+                    if not selector or not value:
+                        continue
+                    
+                    try:
+                        if field_type == "text":
+                            result = await self.mcp.type_text(element=label, ref=selector, text=str(value))
+                        elif field_type == "select":
+                            result = await self.mcp.call_tool("playwright_select", {
+                                "selector": selector,
+                                "value": str(value)
+                            })
+                        elif field_type == "click":
+                            result = await self.mcp.click(element=label, ref=selector)
+                        else:
+                            result = await self.mcp.type_text(element=label, ref=selector, text=str(value))
+                        
+                        if result.success:
+                            self.form_responses[label] = str(value)
+                            logger.info(f"Filled {label}: {str(value)[:50]}")
+                    except Exception as e:
+                        logger.warning(f"Could not fill {label}: {e}")
+                
+                # Answer any questions using Claude
+                questions = re.findall(r'How many years.*?\?|Do you have.*?\?|Are you.*?\?|What is your.*?\?', page_text, re.I)
+                for question in questions[:5]:
+                    if question not in self.form_responses:
+                        answer = await self._answer_question(question, user_profile, job_details)
+                        self.form_responses[question] = answer
+                        logger.info(f"Q: {question[:50]}... A: {answer}")
+                
+                # Use Claude to find and click Next button
+                logger.info("Looking for Next button...")
+                next_clicked = await self._analyze_and_click(
+                    "Next, Continue, or Review button to proceed to the next step",
+                    html
+                )
+                
+                if not next_clicked:
+                    logger.warning("Could not find Next button")
+                
+                await self.mcp.wait_for(time=1.5)
             
             return ApplicationResult(
-                success=False,
-                status="failed",
-                message="Maximum pages reached without submission",
+                success=False, status="incomplete",
+                message="Max pages reached",
                 form_responses=self.form_responses,
-                screenshots=self.screenshots,
                 pages_processed=max_pages
             )
             
         except Exception as e:
-            logger.error(f"❌ Application error: {e}")
+            logger.error(f"Application error: {e}")
             return ApplicationResult(
-                success=False,
-                status="failed",
-                message="Application failed with error",
+                success=False, status="failed",
+                message="Application error",
                 error=str(e),
-                form_responses=self.form_responses,
-                screenshots=self.screenshots
+                form_responses=self.form_responses
             )
-    
-    async def _get_field_mappings(
-        self,
-        snapshot: str,
-        user_profile: Dict,
-        job_details: Dict,
-        kb_id: Optional[int]
-    ) -> List[Dict]:
-        """Get field mappings using LLM + RAG"""
-        
-        # Enrich profile with RAG context if kb_id provided
-        enriched_profile = user_profile.copy()
-        
-        if kb_id and self.rag:
-            # Get relevant context for this job
-            try:
-                context = self.rag.retrieve_relevant_context(
-                    question=f"Job: {job_details.get('title')} at {job_details.get('company')}",
-                    kb_id=kb_id,
-                    max_experiences=3,
-                    max_projects=2,
-                    max_skills=10
-                )
-                enriched_profile["rag_context"] = self.rag.build_context_string(context)
-            except Exception as e:
-                logger.warning(f"RAG retrieval failed: {e}")
-        
-        # Use LLM to analyze form
-        return await self.llm.analyze_form(snapshot, enriched_profile, job_details)
-    
-    async def _fill_field(self, mapping: Dict) -> bool:
-        """Fill a single form field based on mapping"""
-        ref = mapping.get("ref", "")
-        label = mapping.get("label", "Unknown field")
-        value = mapping.get("value", "")
-        field_type = mapping.get("field_type", "text")
-        
-        if not ref or not value:
-            return False
-        
-        # Ensure ref format
-        if not ref.startswith("ref="):
-            ref = f"ref={ref}"
-        
-        # Store response
-        self.form_responses[label] = value
-        
-        try:
-            if field_type in ["text", "textarea", "email", "phone"]:
-                result = await self.mcp.type_text(
-                    element=label,
-                    ref=ref,
-                    text=str(value)
-                )
-            elif field_type == "select":
-                result = await self.mcp.select_option(
-                    element=label,
-                    ref=ref,
-                    values=[str(value)]
-                )
-            elif field_type in ["radio", "checkbox"]:
-                result = await self.mcp.click(
-                    element=label,
-                    ref=ref
-                )
-            else:
-                result = await self.mcp.type_text(
-                    element=label,
-                    ref=ref,
-                    text=str(value)
-                )
-            
-            logger.info(f"{'✅' if result.success else '❌'} {label}: {value[:50]}...")
-            return result.success
-            
-        except Exception as e:
-            logger.error(f"Failed to fill {label}: {e}")
-            return False
 
 
-# =============================================================================
-# Factory Functions
-# =============================================================================
+_service: Optional[UniversalFormService] = None
 
-_universal_service: Optional[UniversalFormService] = None
-
-
-def get_universal_form_service(
-    use_claude: bool = True,
-    claude_api_key: Optional[str] = None
-) -> UniversalFormService:
-    """Get or create universal form service"""
-    global _universal_service
-    if _universal_service is None:
-        _universal_service = UniversalFormService(
-            use_claude=use_claude,
-            claude_api_key=claude_api_key
-        )
-    return _universal_service
+def get_universal_form_service(use_claude: bool = True, claude_api_key: Optional[str] = None) -> UniversalFormService:
+    global _service
+    if _service is None:
+        _service = UniversalFormService(claude_api_key=claude_api_key)
+    return _service

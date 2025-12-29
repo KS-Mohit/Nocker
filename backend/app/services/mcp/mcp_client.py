@@ -88,7 +88,7 @@ class MCPClient:
                         match = re.search(r'sessionId=([a-f0-9-]+)', data)
                         if match:
                             self._session_id = match.group(1)
-                            logger.info(f"✅ SSE Session ID: {self._session_id}")
+                            logger.info(f"SSE Session ID: {self._session_id}")
                             self._connected = True
                     else:
                         # Try to parse as JSON response
@@ -131,7 +131,7 @@ class MCPClient:
                 await asyncio.sleep(0.1)
             
             if not self._session_id:
-                logger.error("❌ Timeout waiting for session ID")
+                logger.error("Timeout waiting for session ID")
                 return False
             
             # Initialize protocol
@@ -139,7 +139,7 @@ class MCPClient:
             return await self._initialize_protocol()
             
         except Exception as e:
-            logger.error(f"❌ Connection failed: {e}")
+            logger.error(f"Connection failed: {e}")
             return False
     
     async def _initialize_protocol(self) -> bool:
@@ -153,13 +153,13 @@ class MCPClient:
             
             if result:
                 self._initialized = True
-                logger.info("✅ MCP protocol initialized")
+                logger.info("MCP protocol initialized")
                 return True
             return False
             
         except Exception as e:
             # Some servers don't need initialize - try without it
-            logger.warning(f"⚠️ Initialize not required or failed: {e}")
+            logger.warning(f"Initialize not required or failed: {e}")
             self._initialized = True  # Proceed anyway
             return True
     
@@ -179,7 +179,7 @@ class MCPClient:
             payload["params"] = params
         
         url = f"{self.server_url}/messages?sessionId={self._session_id}"
-        logger.debug(f"📤 [{request_id}] {method}")
+        logger.debug(f"[{request_id}] {method}")
         
         try:
             # Create a future to receive the response via SSE
@@ -198,9 +198,9 @@ class MCPClient:
             if http_response.status_code >= 400:
                 try:
                     error_data = http_response.json()
-                    logger.error(f"❌ HTTP {http_response.status_code}: {error_data}")
+                    logger.error(f"HTTP {http_response.status_code}: {error_data}")
                 except:
-                    logger.error(f"❌ HTTP {http_response.status_code}: {http_response.text}")
+                    logger.error(f"HTTP {http_response.status_code}: {http_response.text}")
                 del self._responses[request_id]
                 raise Exception(f"HTTP {http_response.status_code}")
             
@@ -216,7 +216,7 @@ class MCPClient:
                     return result.get("result", result)
                 except asyncio.TimeoutError:
                     del self._responses[request_id]
-                    logger.warning(f"⏱️ Timeout waiting for response {request_id}")
+                    logger.warning(f"Timeout waiting for response {request_id}")
                     return {"status": "timeout"}
             
             # For 200 OK, parse response directly
@@ -226,7 +226,7 @@ class MCPClient:
             if "error" in result and result["error"]:
                 raise Exception(f"MCP Error: {result['error']}")
             
-            logger.debug(f"📥 [{request_id}] OK")
+            logger.debug(f"[{request_id}] OK")
             return result.get("result", result)
             
         except Exception as e:
@@ -264,7 +264,7 @@ class MCPClient:
             return MCPResponse(success=True, content=content or "OK", raw_response=result)
             
         except Exception as e:
-            logger.error(f"❌ Tool [{tool_name}] failed: {e}")
+            logger.error(f"Tool [{tool_name}] failed: {e}")
             return MCPResponse(success=False, content=None, error=str(e))
     
     # ==========================================================================
@@ -272,23 +272,23 @@ class MCPClient:
     # ==========================================================================
     
     async def navigate(self, url: str) -> MCPResponse:
-        logger.info(f"🔗 Navigating: {url}")
+        logger.info(f"Navigating: {url}")
         return await self.call_tool("playwright_navigate", {"url": url})
     
     async def click(self, element: str, ref: str, **kwargs) -> MCPResponse:
-        logger.info(f"🖱️ Click: {element}")
+        logger.info(f"Click: {element}")
         return await self.call_tool("playwright_click", {"selector": ref})
     
     async def type_text(self, element: str, ref: str, text: str, **kwargs) -> MCPResponse:
-        logger.info(f"⌨️ Type: {element}")
+        logger.info(f"Type: {element}")
         return await self.call_tool("playwright_fill", {"selector": ref, "value": text})
     
     async def get_snapshot(self) -> MCPResponse:
-        logger.info("📸 Getting page content")
-        return await self.call_tool("playwright_get_text", {"selector": "body"})
+        logger.info("Getting page content")
+        return await self.call_tool("playwright_get_visible_text", {})
     
     async def take_screenshot(self, filename: Optional[str] = None, **kwargs) -> MCPResponse:
-        logger.info("📷 Screenshot")
+        logger.info("Screenshot")
         params = {"path": filename} if filename else {}
         return await self.call_tool("playwright_screenshot", params)
     
@@ -302,7 +302,7 @@ class MCPClient:
         return await self.call_tool("playwright_evaluate", {"script": script})
     
     async def close_browser(self) -> MCPResponse:
-        logger.info("🔒 Close browser")
+        logger.info("Close browser")
         return await self.call_tool("playwright_close", {})
     
     async def wait_for(self, time: Optional[float] = None, **kwargs) -> MCPResponse:
@@ -311,7 +311,15 @@ class MCPClient:
         return MCPResponse(success=True, content="OK")
     
     async def press_key(self, key: str) -> MCPResponse:
-        return await self.evaluate(f"document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {{key: '{key}', bubbles: true}}))")
+        logger.info(f"Pressing key: {key}")
+        return await self.call_tool("playwright_press_key", {"key": key})
+    
+    async def upload_file(self, selector: str, file_path: str) -> MCPResponse:
+        logger.info(f"Uploading file: {file_path}")
+        return await self.call_tool("playwright_upload_file", {
+            "selector": selector,
+            "filePath": file_path
+        })
     
     async def fill_form(self, fields: List[Dict]) -> MCPResponse:
         ok = 0
@@ -332,11 +340,11 @@ class MCPClient:
             r.raise_for_status()
             data = r.json()
             if data.get("status") == "ok":
-                logger.info(f"✅ MCP healthy (v{data.get('version')})")
+                logger.info(f"MCP healthy (v{data.get('version')})")
                 return True
             return False
         except Exception as e:
-            logger.error(f"❌ Health check failed: {e}")
+            logger.error(f"Health check failed: {e}")
             return False
     
     async def list_tools(self) -> List[Dict]:
