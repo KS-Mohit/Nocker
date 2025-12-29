@@ -253,12 +253,14 @@ async def apply_to_job(request: ApplyRequest):
     if not job_details.get("company"):
         job_details["company"] = "Unknown Company"
     
-    # Get Claude API key from environment
+    # Load .env and get Claude API key
+    from dotenv import load_dotenv
     import os
+    load_dotenv()
     claude_api_key = os.environ.get("ANTHROPIC_API_KEY")
     
-    if request.use_claude and not claude_api_key:
-        logger.warning("ANTHROPIC_API_KEY not set, falling back to Ollama")
+    if not claude_api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not found in .env")
     
     # Get resume path from request or knowledge base
     resume_path = request.resume_path
@@ -267,7 +269,6 @@ async def apply_to_job(request: ApplyRequest):
     
     # Create service
     service = UniversalFormService(
-        use_claude=request.use_claude and bool(claude_api_key),
         claude_api_key=claude_api_key
     )
     

@@ -37,7 +37,7 @@ class NavigateRequest(BaseModel):
 class ClickRequest(BaseModel):
     """Request to click element"""
     element: str = Field(..., description="Human-readable element description")
-    ref: str = Field(..., description="CSS selector for the element")
+    ref: str = Field(..., description="Element reference from snapshot (e.g., s1e15)")
 
 
 class TypeRequest(BaseModel):
@@ -50,7 +50,6 @@ class TypeRequest(BaseModel):
 
 class UploadRequest(BaseModel):
     """Request to upload a file"""
-    selector: str = Field(default="input[type='file']", description="CSS selector for file input")
     file_path: str = Field(..., description="Absolute path to the file to upload")
 
 
@@ -222,10 +221,10 @@ async def type_text(request: TypeRequest):
 
 @router.post("/upload")
 async def upload_file(request: UploadRequest):
-    """Upload a file to a file input element"""
+    """Upload a file"""
     client = get_mcp_client()
     result = await client.upload_file(
-        selector=request.selector,
+        selector="",  # Not needed for Microsoft MCP
         file_path=request.file_path
     )
     
@@ -272,7 +271,7 @@ async def close_browser():
 async def get_setup_guide():
     """Get instructions for setting up the Playwright MCP server."""
     return {
-        "title": "Playwright MCP Server Setup Guide",
+        "title": "Microsoft Playwright MCP Server Setup Guide",
         "steps": [
             {
                 "step": 1,
@@ -284,7 +283,7 @@ async def get_setup_guide():
                 "step": 2,
                 "title": "Start MCP Server",
                 "description": "Run in a separate terminal",
-                "command": "npx @executeautomation/playwright-mcp-server --port 8931"
+                "command": "npx @playwright/mcp@latest --port 8931 --browser chrome --user-data-dir ./browser-data"
             },
             {
                 "step": 3,

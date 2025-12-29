@@ -1,36 +1,40 @@
 """
-MCP Client with Persistent SSE Connection
+MCP Client using FastMCP with stdio transport
 
-The MCP SSE protocol requires:
-1. SSE connection stays OPEN for the entire session
-2. Messages are sent via HTTP POST while SSE is open
-3. Responses come back via the SSE stream
+Uses FastMCP to communicate with Microsoft Playwright MCP via stdio.
+This is cleaner and more reliable than HTTP/SSE.
 
-Server: npx @executeautomation/playwright-mcp-server --port 8931
+Requires: pip install fastmcp
+Server: npx @playwright/mcp@latest --browser chrome --user-data-dir ./browser-data
 """
 
-import httpx
-import json
 import asyncio
-import re
+import json
 from typing import Dict, List, Optional, Any
 from loguru import logger
 from dataclasses import dataclass
 from enum import Enum
-import aiohttp
+
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    HAS_MCP = True
+except ImportError:
+    HAS_MCP = False
+    logger.warning("MCP package not installed. Run: pip install mcp")
 
 
 class MCPToolName(str, Enum):
-    """Available MCP tools"""
-    NAVIGATE = "playwright_navigate"
-    CLICK = "playwright_click"
-    FILL = "playwright_fill"
-    SELECT = "playwright_select"
-    HOVER = "playwright_hover"
-    SCREENSHOT = "playwright_screenshot"
-    GET_TEXT = "playwright_get_text"
-    CLOSE = "playwright_close"
-    EVALUATE = "playwright_evaluate"
+    """Available MCP tools from Microsoft Playwright MCP"""
+    NAVIGATE = "browser_navigate"
+    CLICK = "browser_click"
+    TYPE = "browser_type"
+    SELECT = "browser_select_option"
+    SNAPSHOT = "browser_snapshot"
+    SCREENSHOT = "browser_take_screenshot"
+    PRESS_KEY = "browser_press_key"
+    UPLOAD_FILE = "browser_file_upload"
+    CLOSE = "browser_close"
 
 
 @dataclass
@@ -44,356 +48,209 @@ class MCPResponse:
 
 class MCPClient:
     """
-    MCP Client with persistent SSE connection.
-    Uses aiohttp for SSE to keep connection alive.
+    MCP Client using stdio transport via FastMCP.
+    Spawns Microsoft Playwright MCP as subprocess.
     """
     
     def __init__(
         self,
-        server_url: str = "http://localhost:8931",
-        timeout: float = 60.0
+        browser: str = "chrome",
+        user_data_dir: str = "./browser-data",
+        headless: bool = False
     ):
-        self.server_url = server_url.rstrip('/')
-        self.timeout = timeout
-        self._request_id = 0
-        self._session_id: Optional[str] = None
-        self._initialized = False
-        self._sse_session: Optional[aiohttp.ClientSession] = None
-        self._sse_response: Optional[aiohttp.ClientResponse] = None
-        self._sse_task: Optional[asyncio.Task] = None
-        self._responses: Dict[int, asyncio.Future] = {}
+        self.browser = browser
+        self.user_data_dir = user_data_dir
+        self.headless = headless
+        self._session: Optional[ClientSession] = None
+        self._client = None
         self._connected = False
-        self._http_client: Optional[httpx.AsyncClient] = None
-    
-    def _next_request_id(self) -> int:
-        self._request_id += 1
-        return self._request_id
-    
-    async def _get_http_client(self) -> httpx.AsyncClient:
-        if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=self.timeout)
-        return self._http_client
-
-    async def _sse_listener(self):
-        """Background task to listen to SSE events"""
-        try:
-            async for line in self._sse_response.content:
-                line = line.decode('utf-8').strip()
-                
-                if line.startswith('data:'):
-                    data = line[5:].strip()
-                    
-                    # Check for session endpoint
-                    if 'sessionId=' in data:
-                        match = re.search(r'sessionId=([a-f0-9-]+)', data)
-                        if match:
-                            self._session_id = match.group(1)
-                            logger.info(f"SSE Session ID: {self._session_id}")
-                            self._connected = True
-                    else:
-                        # Try to parse as JSON response
-                        try:
-                            response = json.loads(data)
-                            req_id = response.get('id')
-                            if req_id and req_id in self._responses:
-                                self._responses[req_id].set_result(response)
-                        except json.JSONDecodeError:
-                            pass
-                            
-        except asyncio.CancelledError:
-            logger.info("SSE listener cancelled")
-        except Exception as e:
-            logger.error(f"SSE listener error: {e}")
-            self._connected = False
+        
+        # For compatibility
+        self.server_url = "stdio://playwright-mcp"
     
     async def connect(self) -> bool:
-        """Establish persistent SSE connection"""
-        if self._connected and self._session_id:
+        """Connect to Playwright MCP via stdio"""
+        if self._connected and self._session:
             return True
         
+        if not HAS_MCP:
+            logger.error("MCP package not installed. Run: pip install mcp")
+            return False
+        
         try:
-            logger.info("🔌 Opening persistent SSE connection...")
+            logger.info("Starting Playwright MCP via stdio...")
             
-            # Create aiohttp session for SSE
-            self._sse_session = aiohttp.ClientSession()
-            self._sse_response = await self._sse_session.get(
-                f"{self.server_url}/sse",
-                headers={"Accept": "text/event-stream"}
+            # Build command args
+            args = ["@playwright/mcp@latest"]
+            args.extend(["--browser", self.browser])
+            args.extend(["--user-data-dir", self.user_data_dir])
+            if self.headless:
+                args.append("--headless")
+            
+            server_params = StdioServerParameters(
+                command="npx",
+                args=args
             )
             
-            # Start background listener
-            self._sse_task = asyncio.create_task(self._sse_listener())
+            # Create stdio client
+            self._client = stdio_client(server_params)
+            self._read, self._write = await self._client.__aenter__()
             
-            # Wait for session ID
-            for _ in range(50):  # 5 second timeout
-                if self._session_id:
-                    break
-                await asyncio.sleep(0.1)
+            # Create session
+            self._session = ClientSession(self._read, self._write)
+            await self._session.__aenter__()
             
-            if not self._session_id:
-                logger.error("Timeout waiting for session ID")
-                return False
+            # Initialize
+            await self._session.initialize()
             
-            # Initialize protocol
-            await asyncio.sleep(0.2)  # Give SSE a moment
-            return await self._initialize_protocol()
-            
-        except Exception as e:
-            logger.error(f"Connection failed: {e}")
-            return False
-    
-    async def _initialize_protocol(self) -> bool:
-        """Send MCP initialize handshake"""
-        try:
-            result = await self._send_message("initialize", {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "job-agent", "version": "1.0.0"}
-            })
-            
-            if result:
-                self._initialized = True
-                logger.info("MCP protocol initialized")
-                return True
-            return False
-            
-        except Exception as e:
-            # Some servers don't need initialize - try without it
-            logger.warning(f"Initialize not required or failed: {e}")
-            self._initialized = True  # Proceed anyway
+            self._connected = True
+            logger.info("Playwright MCP connected via stdio")
             return True
-    
-    async def _send_message(self, method: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Send JSON-RPC message while SSE is connected"""
-        if not self._session_id:
-            raise Exception("No session - call connect() first")
-        
-        request_id = self._next_request_id()
-        
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-        }
-        if params:
-            payload["params"] = params
-        
-        url = f"{self.server_url}/messages?sessionId={self._session_id}"
-        logger.debug(f"[{request_id}] {method}")
-        
-        try:
-            # Create a future to receive the response via SSE
-            response_future = asyncio.Future()
-            self._responses[request_id] = response_future
-            
-            # Send the request
-            client = await self._get_http_client()
-            http_response = await client.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            )
-            
-            # Check for immediate error
-            if http_response.status_code >= 400:
-                try:
-                    error_data = http_response.json()
-                    logger.error(f"HTTP {http_response.status_code}: {error_data}")
-                except:
-                    logger.error(f"HTTP {http_response.status_code}: {http_response.text}")
-                del self._responses[request_id]
-                raise Exception(f"HTTP {http_response.status_code}")
-            
-            # For 202 Accepted, wait for response via SSE
-            if http_response.status_code == 202:
-                try:
-                    result = await asyncio.wait_for(response_future, timeout=30.0)
-                    del self._responses[request_id]
-                    
-                    if "error" in result and result["error"]:
-                        raise Exception(f"MCP Error: {result['error']}")
-                    
-                    return result.get("result", result)
-                except asyncio.TimeoutError:
-                    del self._responses[request_id]
-                    logger.warning(f"Timeout waiting for response {request_id}")
-                    return {"status": "timeout"}
-            
-            # For 200 OK, parse response directly
-            result = http_response.json()
-            del self._responses[request_id]
-            
-            if "error" in result and result["error"]:
-                raise Exception(f"MCP Error: {result['error']}")
-            
-            logger.debug(f"[{request_id}] OK")
-            return result.get("result", result)
             
         except Exception as e:
-            if request_id in self._responses:
-                del self._responses[request_id]
-            raise
+            logger.error(f"Failed to connect: {e}")
+            return False
     
-    async def call_tool(self, tool_name: str, arguments: Dict) -> MCPResponse:
+    async def disconnect(self):
+        """Disconnect from MCP"""
+        if self._session:
+            await self._session.__aexit__(None, None, None)
+        if self._client:
+            await self._client.__aexit__(None, None, None)
+        self._connected = False
+        self._session = None
+        logger.info("Disconnected from Playwright MCP")
+    
+    async def call_tool(self, tool_name: str, arguments: Dict = None) -> MCPResponse:
         """Call an MCP tool"""
+        if not self._connected:
+            if not await self.connect():
+                return MCPResponse(success=False, content=None, error="Not connected")
+        
         try:
-            if not self._connected or not self._initialized:
-                connected = await self.connect()
-                if not connected:
-                    return MCPResponse(success=False, content=None, error="Failed to connect")
+            result = await self._session.call_tool(tool_name, arguments or {})
             
-            result = await self._send_message("tools/call", {
-                "name": tool_name,
-                "arguments": arguments
-            })
+            # Extract text content
+            text_content = ""
+            if result.content:
+                for item in result.content:
+                    if hasattr(item, 'text'):
+                        text_content += item.text
             
-            # Parse response content
-            content = ""
-            if result:
-                if isinstance(result, dict):
-                    content_list = result.get("content", [])
-                    if isinstance(content_list, list):
-                        for item in content_list:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                content += item.get("text", "")
-                    else:
-                        content = str(content_list)
-                else:
-                    content = str(result)
+            is_error = result.isError if hasattr(result, 'isError') else False
             
-            return MCPResponse(success=True, content=content or "OK", raw_response=result)
+            return MCPResponse(
+                success=not is_error,
+                content=text_content or str(result),
+                error=text_content if is_error else None
+            )
             
         except Exception as e:
-            logger.error(f"Tool [{tool_name}] failed: {e}")
+            logger.error(f"Tool call failed: {e}")
             return MCPResponse(success=False, content=None, error=str(e))
     
-    # ==========================================================================
-    # Browser Operations
-    # ==========================================================================
-    
-    async def navigate(self, url: str) -> MCPResponse:
-        logger.info(f"Navigating: {url}")
-        return await self.call_tool("playwright_navigate", {"url": url})
-    
-    async def click(self, element: str, ref: str, **kwargs) -> MCPResponse:
-        logger.info(f"Click: {element}")
-        return await self.call_tool("playwright_click", {"selector": ref})
-    
-    async def type_text(self, element: str, ref: str, text: str, **kwargs) -> MCPResponse:
-        logger.info(f"Type: {element}")
-        return await self.call_tool("playwright_fill", {"selector": ref, "value": text})
-    
-    async def get_snapshot(self) -> MCPResponse:
-        logger.info("Getting page content")
-        return await self.call_tool("playwright_get_visible_text", {})
-    
-    async def take_screenshot(self, filename: Optional[str] = None, **kwargs) -> MCPResponse:
-        logger.info("Screenshot")
-        params = {"path": filename} if filename else {}
-        return await self.call_tool("playwright_screenshot", params)
-    
-    async def select_option(self, element: str, ref: str, values: List[str]) -> MCPResponse:
-        return await self.call_tool("playwright_select", {"selector": ref, "value": values[0] if values else ""})
-    
-    async def hover(self, element: str, ref: str) -> MCPResponse:
-        return await self.call_tool("playwright_hover", {"selector": ref})
-    
-    async def evaluate(self, script: str) -> MCPResponse:
-        return await self.call_tool("playwright_evaluate", {"script": script})
-    
-    async def close_browser(self) -> MCPResponse:
-        logger.info("Close browser")
-        return await self.call_tool("playwright_close", {})
-    
-    async def wait_for(self, time: Optional[float] = None, **kwargs) -> MCPResponse:
-        if time:
-            await asyncio.sleep(time)
-        return MCPResponse(success=True, content="OK")
-    
-    async def press_key(self, key: str) -> MCPResponse:
-        logger.info(f"Pressing key: {key}")
-        return await self.call_tool("playwright_press_key", {"key": key})
-    
-    async def upload_file(self, selector: str, file_path: str) -> MCPResponse:
-        logger.info(f"Uploading file: {file_path}")
-        return await self.call_tool("playwright_upload_file", {
-            "selector": selector,
-            "filePath": file_path
-        })
-    
-    async def fill_form(self, fields: List[Dict]) -> MCPResponse:
-        ok = 0
-        for f in fields:
-            r = await self.call_tool("playwright_fill", {"selector": f.get("selector") or f.get("ref"), "value": f.get("value", "")})
-            if r.success:
-                ok += 1
-        return MCPResponse(success=ok == len(fields), content=f"Filled {ok}/{len(fields)}")
-    
-    # ==========================================================================
-    # Connection Management
-    # ==========================================================================
-    
-    async def health_check(self) -> bool:
-        try:
-            client = await self._get_http_client()
-            r = await client.get(f"{self.server_url}/health")
-            r.raise_for_status()
-            data = r.json()
-            if data.get("status") == "ok":
-                logger.info(f"MCP healthy (v{data.get('version')})")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
-    
     async def list_tools(self) -> List[Dict]:
+        """List available tools"""
+        if not self._connected:
+            if not await self.connect():
+                return []
+        
         try:
-            if not self._initialized:
-                await self.connect()
-            result = await self._send_message("tools/list")
-            return result.get("tools", []) if result else []
+            result = await self._session.list_tools()
+            return [{"name": t.name, "description": t.description} for t in result.tools]
         except Exception as e:
             logger.error(f"Failed to list tools: {e}")
             return []
     
-    async def close(self):
-        """Cleanup connections"""
-        if self._sse_task:
-            self._sse_task.cancel()
-            try:
-                await self._sse_task
-            except asyncio.CancelledError:
-                pass
-        
-        if self._sse_response:
-            self._sse_response.close()
-        
-        if self._sse_session:
-            await self._sse_session.close()
-        
-        if self._http_client:
-            await self._http_client.aclose()
-        
-        self._session_id = None
-        self._initialized = False
-        self._connected = False
-        logger.info("MCP Client closed")
+    async def health_check(self) -> bool:
+        """Check if MCP is available"""
+        try:
+            if not self._connected:
+                return await self.connect()
+            tools = await self.list_tools()
+            return len(tools) > 0
+        except:
+            return False
+    
+    # High-level methods
+    
+    async def navigate(self, url: str) -> MCPResponse:
+        """Navigate to a URL"""
+        logger.info(f"Navigating: {url}")
+        return await self.call_tool("browser_navigate", {"url": url})
+    
+    async def click(self, element: str, ref: str) -> MCPResponse:
+        """Click on an element"""
+        logger.info(f"Click: {element}")
+        return await self.call_tool("browser_click", {"element": ref, "ref": ref})
+    
+    async def type_text(self, element: str, ref: str, text: str, submit: bool = False) -> MCPResponse:
+        """Type text into an element"""
+        logger.info(f"Type: {element}")
+        params = {"element": ref, "ref": ref, "text": text}
+        if submit:
+            params["submit"] = True
+        return await self.call_tool("browser_type", params)
+    
+    async def get_snapshot(self) -> MCPResponse:
+        """Get accessibility snapshot of the page"""
+        logger.info("Getting page snapshot")
+        return await self.call_tool("browser_snapshot", {})
+    
+    async def take_screenshot(self, filename: Optional[str] = None, full_page: bool = False) -> MCPResponse:
+        """Take a screenshot"""
+        logger.info("Taking screenshot")
+        params = {}
+        if filename:
+            params["filename"] = filename
+        if full_page:
+            params["fullPage"] = True
+        return await self.call_tool("browser_take_screenshot", params)
+    
+    async def press_key(self, key: str) -> MCPResponse:
+        """Press a keyboard key"""
+        logger.info(f"Pressing key: {key}")
+        return await self.call_tool("browser_press_key", {"key": key})
+    
+    async def upload_file(self, selector: str, file_path: str) -> MCPResponse:
+        """Upload a file"""
+        logger.info(f"Uploading file: {file_path}")
+        return await self.call_tool("browser_file_upload", {"paths": [file_path]})
+    
+    async def select_option(self, element: str, ref: str, value: str) -> MCPResponse:
+        """Select an option from dropdown"""
+        logger.info(f"Select: {element} = {value}")
+        return await self.call_tool("browser_select_option", {
+            "element": ref,
+            "ref": ref, 
+            "values": [value]
+        })
+    
+    async def wait_for(self, time: Optional[float] = None) -> MCPResponse:
+        """Wait for a specified time"""
+        if time:
+            await asyncio.sleep(time)
+        return MCPResponse(success=True, content="OK")
+    
+    async def close_browser(self) -> MCPResponse:
+        """Close the browser"""
+        logger.info("Closing browser")
+        return await self.call_tool("browser_close", {})
 
 
 # Singleton
 _mcp_client: Optional[MCPClient] = None
 
 
-def get_mcp_client(server_url: str = "http://localhost:8931") -> MCPClient:
+def get_mcp_client() -> MCPClient:
     global _mcp_client
     if _mcp_client is None:
-        _mcp_client = MCPClient(server_url=server_url)
+        _mcp_client = MCPClient()
     return _mcp_client
 
 
 async def shutdown_mcp_client():
     global _mcp_client
     if _mcp_client:
-        await _mcp_client.close()
+        await _mcp_client.disconnect()
         _mcp_client = None

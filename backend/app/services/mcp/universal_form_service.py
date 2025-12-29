@@ -83,32 +83,26 @@ class UniversalFormService:
             raise
     
     async def _get_html(self) -> str:
-        """Get page HTML for Claude to analyze"""
-        result = await self.mcp.call_tool("playwright_get_visible_html", {
-            "removeScripts": True,
-            "removeStyles": True,
-            "maxLength": 15000
-        })
+        """Get page snapshot for Claude to analyze"""
+        result = await self.mcp.get_snapshot()
         return result.content if result.success else ""
     
-    async def _analyze_and_click(self, target_description: str, html: str = None) -> bool:
-        """Use Claude to find and click the right element"""
-        if not html:
-            html = await self._get_html()
+    async def _analyze_and_click(self, target_description: str, snapshot: str = None) -> bool:
+        """Use Claude to find and click the right element from accessibility snapshot"""
+        if not snapshot:
+            snapshot = await self._get_html()
         
-        prompt = f"""Analyze this HTML and find the CSS selector for: {target_description}
+        prompt = f"""Analyze this accessibility snapshot and find the element reference for: {target_description}
 
-HTML:
-{html[:12000]}
+The snapshot contains elements with references like [ref=s1e15]. Find the correct ref for the target element.
+
+SNAPSHOT:
+{snapshot[:12000]}
 
 Return ONLY a JSON object with:
-- "selector": the CSS selector to click (be specific, prefer classes and IDs)
+- "ref": the element reference (e.g., "s1e15" or the full "[ref=s1e15]")
 - "found": true/false
-
-Examples of good selectors:
-- "button.jobs-apply-button" for LinkedIn Easy Apply
-- "button[aria-label*='Next']" for Next buttons
-- "button.artdeco-button--primary" for primary buttons
+- "element_text": brief description of what you found
 
 JSON only, no explanation:"""
 
@@ -122,25 +116,27 @@ JSON only, no explanation:"""
             
             data = json.loads(clean)
             
-            if data.get("found") and data.get("selector"):
-                selector = data["selector"]
-                logger.info(f"Claude found selector: {selector}")
+            if data.get("found") and data.get("ref"):
+                ref = data["ref"]
+                logger.info(f"Claude found ref: {ref}")
                 
-                result = await self.mcp.click(element=target_description, ref=selector)
+                result = await self.mcp.click(element=target_description, ref=ref)
                 return result.success
         except Exception as e:
             logger.error(f"Failed to parse Claude response: {e}")
         
         return False
     
-    async def _analyze_and_fill_form(self, html: str, user_profile: Dict, job_details: Dict) -> List[Dict]:
-        """Use Claude to analyze form and determine what to fill"""
+    async def _analyze_and_fill_form(self, snapshot: str, user_profile: Dict, job_details: Dict) -> List[Dict]:
+        """Use Claude to analyze form from accessibility snapshot and determine what to fill"""
         
         system = """You are an expert at filling job application forms. 
-Analyze the HTML and return a JSON array of form fields to fill.
+Analyze the accessibility snapshot and return a JSON array of form fields to fill.
+
+The snapshot contains elements with references like [ref=s1e15]. Use these refs to identify fields.
 
 For each field, provide:
-- "selector": CSS selector for the input
+- "ref": the element reference from the snapshot (e.g., "s1e15")
 - "value": value to fill from the user profile
 - "type": "text", "select", or "click"
 - "label": field label for logging
@@ -154,10 +150,10 @@ Be smart about matching:
 
 Return ONLY valid JSON array."""
 
-        prompt = f"""Analyze this form and provide field mappings.
+        prompt = f"""Analyze this form snapshot and provide field mappings.
 
-HTML:
-{html[:10000]}
+SNAPSHOT:
+{snapshot[:10000]}
 
 USER PROFILE:
 Name: {user_profile.get('full_name', 'N/A')}
@@ -250,14 +246,14 @@ Answer (be concise):"""
             
             await self.mcp.wait_for(time=3)
             
-            # Get page HTML for Claude to analyze
+            # Get page snapshot for Claude to analyze
             logger.info("Claude analyzing page to find apply button...")
-            html = await self._get_html()
+            snapshot = await self._get_html()
             
             # Use Claude to find and click the Apply button
             clicked = await self._analyze_and_click(
                 "Apply button - this could be 'Easy Apply', 'Apply Now', 'Apply', 'Submit Application', or similar button to start the job application process",
-                html
+                snapshot
             )
             
             if not clicked:
@@ -275,7 +271,7 @@ Answer (be concise):"""
                 logger.info(f"Processing page {page_num}...")
                 await self.mcp.wait_for(time=1.5)
                 
-                html = await self._get_html()
+                snapshot = await self._get_html()
                 text_result = await self.mcp.get_snapshot()
                 page_text = text_result.content or ""
                 
@@ -303,7 +299,7 @@ Answer (be concise):"""
                         )
                     else:
                         logger.info("Submitting application...")
-                        await self._analyze_and_click("Submit application button", html)
+                        await self._analyze_and_click("Submit application button", snapshot)
                         await self.mcp.wait_for(time=3)
                         
                         return ApplicationResult(
@@ -330,29 +326,26 @@ Answer (be concise):"""
                 
                 # Use Claude to analyze and fill form fields
                 logger.info("Claude analyzing form fields...")
-                field_mappings = await self._analyze_and_fill_form(html, user_profile, job_details)
+                field_mappings = await self._analyze_and_fill_form(snapshot, user_profile, job_details)
                 
                 for mapping in field_mappings:
-                    selector = mapping.get("selector", "")
+                    ref = mapping.get("ref", "")
                     value = mapping.get("value", "")
                     field_type = mapping.get("type", "text")
                     label = mapping.get("label", "Unknown field")
                     
-                    if not selector or not value:
+                    if not ref or not value:
                         continue
                     
                     try:
                         if field_type == "text":
-                            result = await self.mcp.type_text(element=label, ref=selector, text=str(value))
+                            result = await self.mcp.type_text(element=label, ref=ref, text=str(value))
                         elif field_type == "select":
-                            result = await self.mcp.call_tool("playwright_select", {
-                                "selector": selector,
-                                "value": str(value)
-                            })
+                            result = await self.mcp.select_option(element=label, ref=ref, value=str(value))
                         elif field_type == "click":
-                            result = await self.mcp.click(element=label, ref=selector)
+                            result = await self.mcp.click(element=label, ref=ref)
                         else:
-                            result = await self.mcp.type_text(element=label, ref=selector, text=str(value))
+                            result = await self.mcp.type_text(element=label, ref=ref, text=str(value))
                         
                         if result.success:
                             self.form_responses[label] = str(value)
@@ -372,7 +365,7 @@ Answer (be concise):"""
                 logger.info("Looking for Next button...")
                 next_clicked = await self._analyze_and_click(
                     "Next, Continue, or Review button to proceed to the next step",
-                    html
+                    snapshot
                 )
                 
                 if not next_clicked:
