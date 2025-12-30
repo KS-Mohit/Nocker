@@ -85,3 +85,5 @@ playwright-report/
 
 # personal docs 
 sunil_docs/*
+
+browser-data/
