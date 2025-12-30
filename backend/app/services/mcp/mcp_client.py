@@ -128,6 +128,7 @@ class MCPClient:
                 return MCPResponse(success=False, content=None, error="Not connected")
         
         try:
+            logger.debug(f"Calling {tool_name} with {arguments}")
             result = await self._session.call_tool(tool_name, arguments or {})
             
             # Extract text content
@@ -139,6 +140,11 @@ class MCPClient:
             
             is_error = result.isError if hasattr(result, 'isError') else False
             
+            if is_error:
+                logger.warning(f"Tool {tool_name} returned error: {text_content}")
+            else:
+                logger.debug(f"Tool {tool_name} success: {text_content[:200] if text_content else 'OK'}")
+            
             return MCPResponse(
                 success=not is_error,
                 content=text_content or str(result),
@@ -146,7 +152,7 @@ class MCPClient:
             )
             
         except Exception as e:
-            logger.error(f"Tool call failed: {e}")
+            logger.error(f"Tool call {tool_name} failed: {e}")
             return MCPResponse(success=False, content=None, error=str(e))
     
     async def list_tools(self) -> List[Dict]:
@@ -181,12 +187,19 @@ class MCPClient:
     
     async def click(self, element: str, ref: str) -> MCPResponse:
         """Click on an element"""
-        logger.info(f"Click: {element}")
+        logger.info(f"Click: {element} (ref={ref})")
+        # Microsoft MCP browser_click requires both "element" and "ref"
         return await self.call_tool("browser_click", {"element": ref, "ref": ref})
+    
+    async def click_by_text(self, text: str) -> MCPResponse:
+        """Click on an element by its text content"""
+        logger.info(f"Click by text: {text}")
+        # Use text as both element and ref - MCP will search for it
+        return await self.call_tool("browser_click", {"element": text, "ref": text})
     
     async def type_text(self, element: str, ref: str, text: str, submit: bool = False) -> MCPResponse:
         """Type text into an element"""
-        logger.info(f"Type: {element}")
+        logger.info(f"Type: {element} (ref={ref})")
         params = {"element": ref, "ref": ref, "text": text}
         if submit:
             params["submit"] = True
@@ -219,10 +232,10 @@ class MCPClient:
     
     async def select_option(self, element: str, ref: str, value: str) -> MCPResponse:
         """Select an option from dropdown"""
-        logger.info(f"Select: {element} = {value}")
+        logger.info(f"Select: {element} = {value} (ref={ref})")
         return await self.call_tool("browser_select_option", {
             "element": ref,
-            "ref": ref, 
+            "ref": ref,
             "values": [value]
         })
     
