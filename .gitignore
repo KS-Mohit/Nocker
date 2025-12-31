@@ -89,3 +89,5 @@ sunil_docs/*
 # prompt files
 *.prompt
 .prompt/
+
+browser-data/
