@@ -1,17 +1,150 @@
 from typing import Dict, List, Optional
 from loguru import logger
 import httpx
+import google.generativeai as genai
+import json
 from app.core.config import settings
 
 
 class OllamaService:
-    """Service for interacting with Ollama LLM"""
+    """Hybrid Service: Uses Ollama for Text/Chat and Google Gemini for Vision/OCR"""
     
     def __init__(self):
+        # 1. Setup Local Ollama (Text)
         self.base_url = settings.OLLAMA_BASE_URL
         self.model = settings.OLLAMA_MODEL
         self.client = httpx.AsyncClient(timeout=120.0)
+
+        # 2. Setup Google Gemini (Vision)
+        if settings.GOOGLE_API_KEY:
+            try:
+                genai.configure(api_key=settings.GOOGLE_API_KEY)
+                # Use 'gemini-2.5-flash' as the current stable version for OCR/Vision
+                self.vision_model = genai.GenerativeModel('gemini-2.5-flash')
+                logger.info("✅ Google Gemini Vision initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Gemini: {e}")
+                self.vision_model = None
+        else:
+            logger.warning("⚠️ GOOGLE_API_KEY not found. Vision features will fail.")
+            self.vision_model = None
     
+    async def parse_job_screenshot(self, image_bytes: bytes) -> Dict:
+        """
+        Visual Parsing: Sends screenshot to Gemini to extract structured JSON data.
+        """
+        if not self.vision_model:
+            logger.error("Google API Key missing. Cannot parse screenshots.")
+            return {}
+
+        try:
+            logger.info("👀 Sending screenshot to Gemini for visual parsing...")
+
+            # 1. Prepare Image Payload
+            image_part = {
+                "mime_type": "image/png",
+                "data": image_bytes
+            }
+
+            # 2. Strict Prompt for JSON Extraction
+            prompt = """
+            You are a data extraction agent. Analyze this job posting screenshot.
+            Extract the following fields into a valid JSON object:
+            {
+                "title": "Exact Job Title",
+                "company": "Company Name",
+                "location": "Location (City, State or Remote)",
+                "workplace_type": "Remote, On-site, or Hybrid",
+                "job_type": "Full-time, Contract, etc",
+                "description": "Full text of the job description",
+                "is_easy_apply": true/false (if you see an 'Easy Apply' button)
+            }
+            Important: Return ONLY the raw JSON. Do not use Markdown formatting like ```json.
+            """
+
+            # 3. Call Gemini API (Runs in cloud)
+            # generate_content is synchronous, so we wrap it if needed, but usually it's fast enough.
+            response = self.vision_model.generate_content([prompt, image_part])
+            
+            # 4. Parse Response
+            clean_json = response.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(clean_json)
+            
+            logger.info(f"✅ Visual Parse Success: {data.get('title')} at {data.get('company')}")
+            return data
+
+        except Exception as e:
+            logger.error(f"❌ Visual Parsing Failed: {e}")
+            return {}
+
+    async def analyze_form_screenshot(self, image_bytes: bytes, user_profile: Dict) -> List[Dict]:
+        """
+        Vision AI: Analyzes a form screenshot and maps user data to fields.
+        Returns a list of actions to take.
+        """
+        if not self.vision_model:
+            logger.error("Google Vision API not initialized")
+            return []
+
+        try:
+            logger.info("🧠 Analyzing form fields with Vision AI...")
+
+            # 1. Simplify User Profile for the AI (Save tokens, keep it relevant)
+            # We convert the profile to a clean string format
+            profile_context = json.dumps({
+                "full_name": user_profile.get("full_name"),
+                "email": user_profile.get("email"),
+                "phone": user_profile.get("phone"),
+                "current_job": user_profile.get("work_experience", [{}])[0].get("title", "N/A"),
+                "current_company": user_profile.get("work_experience", [{}])[0].get("company", "N/A"),
+                "linkedin": user_profile.get("linkedin_url"),
+                "portfolio": user_profile.get("portfolio_url"),
+                "location": user_profile.get("location"),
+                "skills": user_profile.get("skills", [])[:10], # Top 10 skills
+                "experience_years": 5 # Example: You might want to calculate this dynamically
+            }, indent=2)
+
+            # 2. The Vision Prompt
+            prompt = f"""
+            You are an autonomous form-filling agent. 
+            Look at this screenshot of a job application form.
+            
+            USER PROFILE:
+            {profile_context}
+
+            INSTRUCTIONS:
+            1. Identify every visible input field (Text, Radio, Checkbox, Dropdown).
+            2. Match the field to the User Profile data provided above.
+            3. If the question is a custom question (e.g., "Why do you want this job?"), generate a short, professional answer.
+            4. If there is a "Next", "Continue", or "Review" button, include it as the final action.
+            5. IGNORE the "Easy Apply" button or "X" close buttons. Focus on the form content.
+
+            OUTPUT FORMAT (JSON ONLY):
+            Return a JSON List of actions. format:
+            [
+                {{ "action": "fill", "label_text": "First name", "value": "John" }},
+                {{ "action": "click", "label_text": "Yes" }}, (For radio/checkbox)
+                {{ "action": "select", "label_text": "Country", "value": "United States" }},
+                {{ "action": "click_button", "text": "Next" }}
+            ]
+            """
+
+            image_part = {"mime_type": "image/png", "data": image_bytes}
+            
+            # 3. Call Gemini
+            response = self.vision_model.generate_content([prompt, image_part])
+            
+            # 4. Clean and Parse
+            clean_json = response.text.replace("```json", "").replace("```", "").strip()
+            actions = json.loads(clean_json)
+            
+            logger.info(f"⚡ AI identified {len(actions)} actions to perform.")
+            return actions
+
+        except Exception as e:
+            logger.error(f"❌ Form Analysis Failed: {e}")
+            return []
+
     async def generate(
         self,
         prompt: str,
@@ -21,20 +154,10 @@ class OllamaService:
     ) -> str:
         """
         Generate text using Ollama
-        
-        Args:
-            prompt: User prompt
-            system_prompt: System instructions
-            temperature: Randomness (0-1, lower = more focused)
-            max_tokens: Maximum response length
-            
-        Returns:
-            Generated text
         """
         try:
             logger.info(f"Generating response with {self.model}...")
             
-            # Prepare request
             payload = {
                 "model": self.model,
                 "prompt": prompt,
@@ -48,7 +171,6 @@ class OllamaService:
             if system_prompt:
                 payload["system"] = system_prompt
             
-            # Call Ollama API
             response = await self.client.post(
                 f"{self.base_url}/api/generate",
                 json=payload
@@ -64,7 +186,7 @@ class OllamaService:
         except Exception as e:
             logger.error(f"Ollama generation error: {e}")
             raise
-    
+
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -73,14 +195,6 @@ class OllamaService:
     ) -> str:
         """
         Chat with Ollama using conversation history
-        
-        Args:
-            messages: List of {"role": "user/assistant/system", "content": "..."}
-            temperature: Randomness
-            max_tokens: Max response length
-            
-        Returns:
-            Assistant's response
         """
         try:
             logger.info(f"Chat with {len(messages)} messages...")
@@ -111,7 +225,7 @@ class OllamaService:
         except Exception as e:
             logger.error(f"Ollama chat error: {e}")
             raise
-    
+
     async def answer_job_question(
         self,
         question: str,
@@ -120,20 +234,10 @@ class OllamaService:
     ) -> str:
         """
         Answer a job application question using user profile
-        
-        Args:
-            question: Application question
-            user_profile: User's resume/experience data
-            job_details: Job title, company, description
-            
-        Returns:
-            AI-generated answer
         """
         try:
-            # Build context from user profile
             context = self._build_user_context(user_profile)
             
-            # Build prompt
             system_prompt = """You are a professional career advisor helping someone answer job application questions.
             
 Guidelines:
@@ -167,7 +271,7 @@ Provide a professional answer based on the user's profile:"""
         except Exception as e:
             logger.error(f"Error answering question: {e}")
             raise
-    
+
     async def generate_cover_letter(
         self,
         user_profile: Dict,
@@ -176,14 +280,6 @@ Provide a professional answer based on the user's profile:"""
     ) -> str:
         """
         Generate a tailored cover letter
-        
-        Args:
-            user_profile: User's experience data
-            job_details: Job information
-            template: Optional template to follow
-            
-        Returns:
-            Generated cover letter
         """
         try:
             context = self._build_user_context(user_profile)
@@ -224,7 +320,7 @@ Write a compelling cover letter:"""
         except Exception as e:
             logger.error(f"Error generating cover letter: {e}")
             raise
-    
+
     def _build_user_context(self, user_profile: Dict) -> str:
         """Build context string from user profile"""
         context_parts = []
@@ -237,7 +333,7 @@ Write a compelling cover letter:"""
         
         if user_profile.get('work_experience'):
             context_parts.append("Work Experience:")
-            for exp in user_profile['work_experience'][:3]:  # Top 3
+            for exp in user_profile['work_experience'][:3]:
                 context_parts.append(f"- {exp.get('title')} at {exp.get('company')}: {exp.get('description', '')[:200]}")
         
         if user_profile.get('skills'):
@@ -250,7 +346,7 @@ Write a compelling cover letter:"""
                 context_parts.append(f"- {edu.get('degree')} from {edu.get('school')}")
         
         return "\n".join(context_parts)
-    
+
     async def close(self):
         """Close HTTP client"""
         await self.client.aclose()

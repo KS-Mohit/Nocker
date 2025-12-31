@@ -1,412 +1,256 @@
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from loguru import logger
 import time
+import asyncio
+import os
 import re
+import json
 from app.services.browser.playwright_service import PlaywrightService
 from app.services.ai.ollama_service import OllamaService
 
-
 class LinkedInFormFiller(PlaywrightService):
-    """Fill out LinkedIn Easy Apply forms automatically"""
+    """
+    AI-Powered Form Filler using Vision (Gemini) + Playwright.
+    """
+    
+    COOKIES_FILE = "linkedin_cookies.json"
     
     def __init__(self):
         super().__init__()
-        self.ollama = OllamaService()
+        self.ai_service = OllamaService()
     
-    async def apply_to_job(
-        self,
-        job_url: str,
-        user_profile: Dict,
-        job_details: Dict
-    ) -> Dict:
-        """
-        Complete job application on LinkedIn
+    def _normalize_job_url(self, job_url: str) -> str:
+        """Convert any LinkedIn job URL format to direct view URL to ensure consistent DOM"""
+        # Clean the input
+        clean_url = job_url.replace("[", "").replace("]", "").replace("(", "").replace(")", "").strip()
         
-        Args:
-            job_url: LinkedIn job URL
-            user_profile: User's knowledge base data
-            job_details: Job information
-            
-        Returns:
-            Application result with status
+        patterns = [
+            r'currentJobId=(\d+)',
+            r'/jobs/view/(\d+)',
+            r'jobId=(\d+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, clean_url)
+            if match:
+                job_id = match.group(1)
+                return f"https://www.linkedin.com/jobs/view/{job_id}/"
+        
+        return clean_url
+
+    async def apply_to_job(self, job_url: str, user_profile: Dict, job_details: Dict) -> Dict:
         """
+        Main orchestration method for applying to a job.
+        """
+        # 1. Normalize URL to force the "Clean Layout"
+        target_url = self._normalize_job_url(job_url)
+        
         await self.start()
-        await self._load_cookies()
         
         try:
-            # Navigate to job
-            await self.goto(job_url)
-            time.sleep(3)
+            # 2. Setup & Navigate
+            await self._load_cookies()
+            logger.info(f"🔗 Navigating to CLEAN job view: {target_url}")
+            await self.goto(target_url)
             
-            # Check for Easy Apply button
-            has_easy_apply = await self._check_easy_apply()
+            # 3. Click Easy Apply (With Retry & Wait)
+            clicked = await self._click_easy_apply()
             
-            if not has_easy_apply:
-                logger.warning("No Easy Apply button found")
-                return {
-                    "success": False,
-                    "error": "Job does not have Easy Apply option"
-                }
+            if not clicked:
+                await self._save_debug_screenshot()
+                logger.error("❌ Easy Apply button missing. Saved 'debug_no_button.png'.")
+                return {"success": False, "error": "No Easy Apply button found (Check debug_no_button.png)"}
             
-            # Click Easy Apply
-            await self._click_easy_apply()
-            time.sleep(2)
+            logger.info("✅ Easy Apply clicked. Starting Vision Form Loop...")
             
-            # Fill out multi-step form
-            application_data = await self._fill_application_form(
-                user_profile, 
-                job_details
-            )
+            # 4. The Vision Loop
+            max_pages = 10
+            page_count = 0
             
-            # Submit (or save draft if testing)
-            # await self._submit_application()
-            
-            logger.info("Application completed successfully!")
-            
-            return {
-                "success": True,
-                "message": "Application submitted",
-                "form_responses": application_data
-            }
-            
+            while page_count < max_pages:
+                page_count += 1
+                logger.info(f"📄 Processing Form Page {page_count}...")
+                
+                # A. Capture State
+                screenshot_bytes, form_status = await self._capture_form_state()
+                
+                # Check if we are done
+                if form_status == "submitted":
+                    return {"success": True, "message": "Application Submitted!"}
+
+                # B. AI Analysis
+                actions = await self.ai_service.analyze_form_screenshot(screenshot_bytes, user_profile)
+                
+                if not actions:
+                    logger.warning("⚠️ AI found no actions. Attempting to force 'Next'...")
+                    actions = [{"action": "click_button", "text": "Next"}]
+
+                # C. Execute Actions
+                result = await self._execute_actions(actions)
+                
+                if result == "submitted":
+                     return {"success": True, "message": "Application Submitted!"}
+                
+                # Wait for next page transition
+                time.sleep(3)
+
+            return {"success": False, "error": "Max pages reached"}
+
         except Exception as e:
-            logger.error(f"Application error: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            logger.error(f"❌ Application Error: {e}")
+            return {"success": False, "error": str(e)}
         finally:
-            await self.ollama.close()
             await self.close()
-    
-    def _check_easy_apply_sync(self) -> bool:
-        """Check if Easy Apply button exists"""
-        try:
-            if not self.page:
-                return False
-            
-            # Multiple selectors for Easy Apply button
-            selectors = [
-                "button.jobs-apply-button",
-                "button:has-text('Easy Apply')",
-                ".jobs-apply-button--top-card button",
-            ]
-            
-            for selector in selectors:
-                button = self.page.query_selector(selector)
-                if button:
-                    return True
-            
-            return False
-            
-        except Exception:
-            return False
-    
-    async def _check_easy_apply(self) -> bool:
-        """Async wrapper for checking Easy Apply"""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._check_easy_apply_sync)
-    
-    def _click_easy_apply_sync(self):
-        """Click Easy Apply button"""
-        if not self.page:
-            raise Exception("Page not initialized")
+            await self.ai_service.close()
+
+    # =========================================================================
+    # SYNC HELPERS (Run in Executor)
+    # =========================================================================
+
+    def _click_easy_apply_sync(self) -> bool:
+        """Find and click the Easy Apply button with Waiting"""
+        if not self.page: return False
         
+        # Robust selectors list
         selectors = [
             "button.jobs-apply-button",
+            "button[aria-label*='Easy Apply']", 
             "button:has-text('Easy Apply')",
+            ".jobs-apply-button--top-card button",
+            # Fallback: Find any button that contains the text 'Easy Apply' inside it
+            "button:has(.artdeco-button__text:has-text('Easy Apply'))"
         ]
+
+        logger.info("👀 Looking for Easy Apply button...")
         
-        for selector in selectors:
-            button = self.page.query_selector(selector)
-            if button:
-                button.click()
-                logger.info("Clicked Easy Apply button")
-                return
-        
-        raise Exception("Easy Apply button not found")
-    
-    async def _click_easy_apply(self):
-        """Async wrapper"""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self._click_easy_apply_sync)
-    
-    async def _fill_application_form(
-        self,
-        user_profile: Dict,
-        job_details: Dict
-    ) -> Dict:
-        """
-        Fill out multi-step application form
-        """
-        form_responses = {}
-        step = 1
-        max_steps = 10
-        
-        while step <= max_steps:
-            logger.info(f"Processing form step {step}")
-            
-            time.sleep(2)  # Wait for form to load
-            
-            # Detect and fill form fields
-            step_responses = await self._fill_current_form_step(
-                user_profile,
-                job_details
-            )
-            
-            form_responses[f"step_{step}"] = step_responses
-            
-            # Check if there's a "Next" button
-            has_next = await self._click_next_button()
-            
-            if not has_next:
-                logger.info("Reached final step")
-                break
-            
-            step += 1
-        
-        return form_responses
-    
-    async def _fill_current_form_step(
-        self,
-        user_profile: Dict,
-        job_details: Dict
-    ) -> Dict:
-        """Fill fields on current form step"""
-        responses = {}
-        
-        # Detect all input fields
-        fields = await self._detect_form_fields()
-        
-        for field in fields:
-            field_type = field.get('type')
-            field_label = field.get('label', '')
-            field_selector = field.get('selector')
-            
-            logger.info(f"  Field: {field_label} ({field_type})")
-            
-            # Determine what to fill based on field label
-            value = await self._determine_field_value(
-                field_label,
-                field_type,
-                user_profile,
-                job_details
-            )
-            
-            if value:
-                await self._fill_field(field_selector, value, field_type)
-                responses[field_label] = value
-        
-        return responses
-    
-    def _detect_form_fields_sync(self) -> List[Dict]:
-        """Detect all form fields on current page"""
-        if not self.page:
-            return []
-        
-        fields = []
-        
-        # Text inputs
-        text_inputs = self.page.query_selector_all('input[type="text"], input[type="email"], input[type="tel"]')
-        for input_el in text_inputs:
-            label_el = self.page.evaluate('(el) => el.previousElementSibling?.textContent || el.placeholder || ""', input_el)
-            fields.append({
-                'type': 'text',
-                'label': label_el,
-                'selector': f'input[type="{input_el.get_attribute("type")}"]',
-                'element': input_el
-            })
-        
-        # Textareas
-        textareas = self.page.query_selector_all('textarea')
-        for textarea in textareas:
-            label_el = self.page.evaluate('(el) => el.previousElementSibling?.textContent || el.placeholder || ""', textarea)
-            fields.append({
-                'type': 'textarea',
-                'label': label_el,
-                'selector': 'textarea',
-                'element': textarea
-            })
-        
-        # Select dropdowns
-        selects = self.page.query_selector_all('select')
-        for select in selects:
-            label_el = self.page.evaluate('(el) => el.previousElementSibling?.textContent || ""', select)
-            fields.append({
-                'type': 'select',
-                'label': label_el,
-                'selector': 'select',
-                'element': select
-            })
-        
-        return fields
-    
-    async def _detect_form_fields(self) -> List[Dict]:
-        """Async wrapper"""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._detect_form_fields_sync)
-    
-    async def _determine_field_value(
-        self,
-        field_label: str,
-        field_type: str,
-        user_profile: Dict,
-        job_details: Dict
-    ) -> Optional[str]:
-        """Determine what value to put in a field"""
-        label_lower = field_label.lower()
-        
-        # Name fields
-        if 'first name' in label_lower:
-            name_parts = user_profile.get('full_name', '').split()
-            return name_parts[0] if name_parts else None
-        
-        if 'last name' in label_lower:
-            name_parts = user_profile.get('full_name', '').split()
-            return ' '.join(name_parts[1:]) if len(name_parts) > 1 else None
-        
-        if 'full name' in label_lower or 'your name' in label_lower:
-            return user_profile.get('full_name')
-        
-        # Contact info
-        if 'email' in label_lower:
-            return user_profile.get('email')
-        
-        if 'phone' in label_lower:
-            return user_profile.get('phone')
-        
-        if 'location' in label_lower or 'city' in label_lower:
-            return user_profile.get('location')
-        
-        # LinkedIn URL
-        if 'linkedin' in label_lower:
-            return user_profile.get('linkedin_url')
-        
-        # Portfolio/Website
-        if 'website' in label_lower or 'portfolio' in label_lower:
-            return user_profile.get('portfolio_url')
-        
-        # Check if it's a custom question (requires AI)
-        if field_type == 'textarea' or 'why' in label_lower or 'describe' in label_lower:
-            # Use AI to answer
-            answer = await self._answer_custom_question(
-                field_label,
-                user_profile,
-                job_details
-            )
-            return answer
-        
-        # Check Q&A pairs
-        qa_pairs = user_profile.get('qa_pairs', {})
-        for question, answer in qa_pairs.items():
-            if question.lower() in label_lower or label_lower in question.lower():
-                return answer
-        
-        return None
-    
-    async def _answer_custom_question(
-        self,
-        question: str,
-        user_profile: Dict,
-        job_details: Dict
-    ) -> str:
-        """Use AI to answer a custom application question"""
-        logger.info(f"Using AI to answer: {question}")
-        
-        try:
-            answer = await self.ollama.answer_job_question(
-                question=question,
-                user_profile=user_profile,
-                job_details=job_details
-            )
-            return answer
-        except Exception as e:
-            logger.error(f"AI answer error: {e}")
-            return ""
-    
-    async def _fill_field(self, selector: str, value: str, field_type: str):
-        """Fill a form field"""
-        await self.fill(selector, value)
-        logger.info(f"  Filled: {value[:50]}...")
-    
-    def _click_next_button_sync(self) -> bool:
-        """Click Next/Continue button if exists"""
-        if not self.page:
-            return False
-        
-        selectors = [
-            "button:has-text('Next')",
-            "button:has-text('Continue')",
-            "button[aria-label='Continue to next step']",
-            ".artdeco-button--primary:has-text('Next')",
-        ]
-        
-        for selector in selectors:
-            button = self.page.query_selector(selector)
-            if button:
-                button.click()
-                logger.info("Clicked Next button")
-                return True
+        # Try to find it for up to 10 seconds
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            for selector in selectors:
+                try:
+                    btn = self.page.query_selector(selector)
+                    if btn and btn.is_visible():
+                        logger.info(f"✅ Found button with selector: {selector}")
+                        btn.click()
+                        return True
+                except:
+                    continue
+            time.sleep(1) # Wait a bit before retrying
         
         return False
-    
-    async def _click_next_button(self) -> bool:
-        """Async wrapper"""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._click_next_button_sync)
-    
-    def _submit_application_sync(self):
-        """Submit the application"""
-        if not self.page:
-            raise Exception("Page not initialized")
+
+    def _save_debug_screenshot_sync(self):
+        if self.page:
+            try:
+                self.page.screenshot(path="debug_no_button.png")
+            except Exception as e:
+                logger.error(f"Failed to save debug screenshot: {e}")
+
+    def _capture_form_state_sync(self) -> Tuple[Optional[bytes], str]:
+        if not self.page: raise ValueError("Browser not active")
         
-        selectors = [
-            "button:has-text('Submit application')",
-            "button:has-text('Submit')",
-            ".artdeco-button--primary:has-text('Submit')",
-        ]
+        # 1. Check for success indicators
+        try:
+            success_text = self.page.get_by_text("Application sent", exact=False)
+            if success_text.count() > 0 and success_text.first.is_visible():
+                return None, "submitted"
+        except:
+            pass
+
+        # 2. Focus on the modal
+        try:
+            modal = self.page.locator(".jobs-easy-apply-content")
+            if modal.count() > 0 and modal.first.is_visible():
+                time.sleep(0.5) 
+                return modal.first.screenshot(), "active"
+            else:
+                return self.page.screenshot(), "active"
+        except:
+            return self.page.screenshot(), "active"
+
+    def _execute_actions_sync(self, actions: List[Dict]) -> str:
+        if not self.page: return "error"
         
-        for selector in selectors:
-            button = self.page.query_selector(selector)
-            if button:
-                # COMMENTED OUT FOR SAFETY - uncomment when ready to actually submit
-                # button.click()
-                logger.info("Would submit application here (currently disabled for safety)")
-                return
+        for act in actions:
+            action_type = act.get("action")
+            label = act.get("label_text")
+            value = act.get("value")
+            text = act.get("text")
+
+            try:
+                if action_type == "fill":
+                    logger.info(f"✍️ Filling '{label}' with '{value}'")
+                    inp = self.page.get_by_label(label, exact=False)
+                    if inp.count() == 0:
+                        inp = self.page.get_by_placeholder(label, exact=False)
+                    
+                    if inp.count() > 0:
+                        inp.first.fill(str(value))
+                    else:
+                        logger.warning(f"Field '{label}' not found.")
+
+                elif action_type == "click":
+                    logger.info(f"🔘 Clicking option '{label}'")
+                    self.page.get_by_text(label, exact=True).first.click()
+
+                elif action_type == "select":
+                    logger.info(f"🔽 Selecting '{value}' for '{label}'")
+                    try:
+                        self.page.get_by_label(label, exact=False).select_option(label=value)
+                    except:
+                        self.page.get_by_label(label, exact=False).click()
+                        time.sleep(0.5)
+                        self.page.get_by_text(value, exact=True).first.click()
+
+                elif action_type == "click_button":
+                    btn_text = text
+                    logger.info(f"👉 Clicking Button: {btn_text}")
+                    if "Submit" in btn_text:
+                        # UNCOMMENT TO APPLY
+                        # self.page.get_by_role("button", name=btn_text, exact=False).click()
+                        logger.info("🛑 SAFETY MODE: Would have submitted here.")
+                        return "submitted"
+                    else:
+                        btn = self.page.get_by_role("button", name=btn_text, exact=False)
+                        if btn.count() > 0:
+                            btn.first.click()
+                        else:
+                            self.page.get_by_text(btn_text, exact=False).click()
+            
+            except Exception as e:
+                logger.error(f"Failed to execute action {act}: {e}")
         
-        logger.warning("Submit button not found")
-    
-    async def _submit_application(self):
-        """Async wrapper"""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self._submit_application_sync)
-    
+        return "continue"
+
     def _load_cookies_sync(self):
-        """Load LinkedIn cookies"""
-        import os
-        import json
-        
-        cookies_file = "linkedin_cookies.json"
-        if not os.path.exists(cookies_file):
-            logger.warning("No cookies file found")
-            return
-        
-        if not self.context:
-            return
-        
-        with open(cookies_file, 'r') as f:
-            cookies = json.load(f)
-        
-        self.context.add_cookies(cookies)
-        logger.info("Cookies loaded")
+        if os.path.exists(self.COOKIES_FILE) and self.context:
+            try:
+                with open(self.COOKIES_FILE, 'r') as f:
+                    self.context.add_cookies(json.load(f))
+                logger.info("🍪 Cookies loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load cookies: {e}")
+
+    # =========================================================================
+    # ASYNC WRAPPERS
+    # =========================================================================
+    
+    async def _click_easy_apply(self):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._click_easy_apply_sync)
+
+    async def _save_debug_screenshot(self):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._save_debug_screenshot_sync)
+
+    async def _capture_form_state(self):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._capture_form_state_sync)
+
+    async def _execute_actions(self, actions):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._execute_actions_sync, actions)
     
     async def _load_cookies(self):
-        """Async wrapper"""
-        import asyncio
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self._load_cookies_sync)
+        return await loop.run_in_executor(self.executor, self._load_cookies_sync)
