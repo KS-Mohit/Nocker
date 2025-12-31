@@ -87,5 +87,5 @@ playwright-report/
 sunil_docs/*
 
 # prompt files
-.prompt
-.prompt/*
+*.prompt
+.prompt/
